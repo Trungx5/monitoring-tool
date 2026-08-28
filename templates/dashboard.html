@@ -175,9 +175,39 @@
   .os-badge { background: rgba(91,141,239,0.12); color: var(--accent); border-color: rgba(91,141,239,0.35); }
   /* Pinned targets sort to the front; the badge says why. */
   .pin-badge { background: rgba(230,170,60,0.14); color: #e0a33a; border-color: rgba(230,170,60,0.4); }
-  .pin-btn { width: auto; padding: 0 10px; font-size: 11.5px; }
-  .pin-btn.on { border-color: rgba(230,170,60,0.55); color: #e0a33a; }
-  .pin-btn:hover { border-color: #e0a33a; color: #e0a33a; }
+  /* One button per row instead of four. The popup is positioned with
+     position:fixed at open time so it can never be clipped by a scrolling
+     table or a card with its own overflow. */
+  .row-menu { position: relative; display: inline-block; vertical-align: middle; }
+  .row-menu-btn {
+    display: inline-flex; flex-direction: column; justify-content: center;
+    align-items: center; gap: 3px;
+    width: 28px; height: 26px; padding: 0; cursor: pointer;
+    background: none; border: 1px solid var(--border); border-radius: 6px;
+  }
+  .row-menu-btn span {
+    display: block; width: 13px; height: 1.5px; border-radius: 1px;
+    background: var(--muted); transition: background 0.12s;
+  }
+  .row-menu-btn:hover { border-color: var(--accent); }
+  .row-menu-btn:hover span, .row-menu.open .row-menu-btn span { background: var(--accent); }
+  .row-menu.open .row-menu-btn { border-color: var(--accent); }
+  .row-menu-pop {
+    display: none; position: fixed; z-index: 90; min-width: 156px;
+    padding: 5px; background: var(--card); border: 1px solid var(--border);
+    border-radius: 8px; box-shadow: 0 10px 26px rgba(0,0,0,0.45);
+    text-align: left;
+  }
+  .row-menu.open .row-menu-pop { display: block; }
+  .row-menu-pop button {
+    display: block; width: 100%; text-align: left; margin: 0;
+    padding: 7px 10px; font-size: 12px; line-height: 1.2;
+    background: none; border: 0; border-radius: 5px;
+    color: var(--text); cursor: pointer; white-space: nowrap;
+  }
+  .row-menu-pop button:hover { background: rgba(91,141,239,0.14); color: var(--accent); }
+  .row-menu-pop button.danger:hover { background: rgba(224,82,78,0.14); color: var(--bad); }
+  .row-menu-sep { height: 1px; margin: 4px 5px; background: var(--border); }
   /* Free-text labels, e.g. a customer name shared across VPS, web and IP. */
   .tag-chip {
     display: inline-block; font-size: 10.5px; padding: 1px 8px; margin: 3px 4px 0 0;
@@ -188,6 +218,8 @@
   .tag-filter { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
   .tag-filter select { width: auto; min-width: 190px; }
   .tag-filter .hint { font-size: 11.5px; color: var(--muted); }
+  .tag-targets td { padding-top: 0 !important; }
+  .tag-targets .tag-chip { margin-top: 0; margin-bottom: 6px; }
   .chart-card {
     background: var(--card);
     border: 1px solid var(--border);
@@ -956,11 +988,34 @@
   <div class="view" id="view-config">
     <div class="subtabs">
       <button class="subtab active" data-sub="config-thresholds">Thresholds</button>
+      <button class="subtab" data-sub="config-tags">Tag Manager</button>
       <button class="subtab" data-sub="config-users">Users</button>
       <button class="subtab" data-sub="config-audit">Audit Log</button>
       <button class="subtab" data-sub="config-logs">Event Logs</button>
       <button class="subtab" data-sub="config-account">My Account</button>
     </div>
+    <div class="subview" id="sub-config-tags">
+      <h2 class="section-title">Tag Manager</h2>
+      <div class="panel-card" style="max-width:900px;">
+        <div id="tagManagerEmpty" class="empty-state" style="display:none;">
+          No tags yet. Add one from a target&rsquo;s menu under
+          <strong>VPS Monitor</strong>, <strong>Web Monitor</strong> or <strong>IP Monitor</strong>.
+        </div>
+        <table class="subs-table" id="tagManagerTable" style="display:none;">
+          <thead><tr>
+            <th>Tag</th><th>VPS</th><th>Websites</th><th>IPs</th><th>Total</th><th></th>
+          </tr></thead>
+          <tbody id="tagManagerBody"></tbody>
+        </table>
+      </div>
+      <div class="stat-sub" style="max-width:900px;">
+        One tag can sit on a VPS, a website and an IP at once &mdash; a customer name, an
+        environment, a site. Renaming or removing a tag here applies to every target that
+        carries it; the targets themselves are never touched. Renaming onto a name already
+        in use merges the two.
+      </div>
+    </div>
+
     <div class="subview active" id="sub-config-thresholds">
       <h2 class="section-title">Thresholds</h2>
       <div class="panel-card" style="max-width:560px;">
@@ -1175,6 +1230,7 @@ const SUBTAB_LOADERS = {
   'notify-add': () => renderAlertsForm(),
   'notify-list': () => refreshSubscriptions(),
   'config-thresholds': () => renderAlertsForm(),
+  'config-tags': () => renderTagManager(),
   'config-users': () => refreshUsers(),
   'config-audit': () => refreshAudit(),
   'config-logs': () => refreshLogs(),
@@ -1375,15 +1431,129 @@ function tagChipsHtml(t) {
   return '<div>' + tags.map(x => `<span class="tag-chip">${escapeHtml(x)}</span>`).join('') + '</div>';
 }
 
-function pinButtonHtml(type, t) {
-  const on = t.pinned ? ' on' : '';
-  const label = t.pinned ? 'Unpin' : 'Pin';
-  return `<button type="button" class="btn pin-btn${on}" data-pin-type="${type}" `
-       + `data-pin-id="${t.id}" data-pin-to="${t.pinned ? '0' : '1'}">${label}</button>`;
+// Every row exposes the same four actions behind one button. What differs
+// per monitor type is only how to find the row's object and what "edit" and
+// "delete" mean, so that is all this table holds.
+const ROW_MENU_TYPES = {
+  vps: {
+    find: id => instances.find(x => x.id === id),
+    edit: t => startEditInstance(t),
+    remove: t => deleteInstance(t.id),
+    reload: () => loadInstances(),
+  },
+  web: {
+    find: id => webTargets.find(x => x.id === id),
+    edit: t => startEditWeb(t),
+    remove: async t => {
+      if (!confirm(`Stop monitoring "${t.name}" and delete its history?`)) return;
+      await apiFetch('/api/web-targets/' + t.id, { method: 'DELETE' });
+      await refreshWebTargets();
+    },
+    reload: () => refreshWebTargets(),
+  },
+  ip: {
+    find: id => ipTargets.find(x => x.id === id),
+    edit: t => startEditIp(t),
+    remove: async t => {
+      if (!confirm(`Stop monitoring "${t.name}" and delete its history?`)) return;
+      await apiFetch('/api/ip-targets/' + t.id, { method: 'DELETE' });
+      await refreshIpTargets();
+    },
+    reload: () => refreshIpTargets(),
+  },
+};
+
+// `opts.edit` / `opts.del` gate the two entries that change the target
+// itself, because the VPS picker list offers edit but not delete. With
+// neither, the row has nothing to offer and gets no button at all.
+function rowMenuHtml(type, t, opts) {
+  const o = opts || {};
+  const items = [
+    `<button type="button" data-rm-act="pin">${t.pinned ? 'Unpin' : 'Pin to top'}</button>`,
+    '<button type="button" data-rm-act="tags">Edit tags\u2026</button>',
+  ];
+  if (o.edit || o.del) items.push('<div class="row-menu-sep"></div>');
+  if (o.edit) items.push('<button type="button" data-rm-act="edit">Edit</button>');
+  if (o.del) items.push('<button type="button" class="danger" data-rm-act="del">Delete</button>');
+
+  return `<span class="row-menu" data-rm-type="${type}" data-rm-id="${t.id}">`
+       + '<button type="button" class="row-menu-btn" title="Actions" aria-haspopup="true"'
+       + ' aria-expanded="false"><span></span><span></span><span></span></button>'
+       + `<div class="row-menu-pop">${items.join('')}</div></span>`;
 }
 
-function tagButtonHtml(type, t) {
-  return `<button type="button" class="btn pin-btn" data-tag-type="${type}" data-tag-id="${t.id}">Tags</button>`;
+let openRowMenu = null;
+
+function closeRowMenu() {
+  if (!openRowMenu) return;
+  const btn = openRowMenu.querySelector('.row-menu-btn');
+  if (btn) btn.setAttribute('aria-expanded', 'false');
+  openRowMenu.classList.remove('open');
+  openRowMenu = null;
+}
+
+// Measured after the popup is displayed, so it can flip above the button
+// near the bottom of the window instead of running off it.
+function placeRowMenu(wrap) {
+  const pop = wrap.querySelector('.row-menu-pop');
+  const rect = wrap.querySelector('.row-menu-btn').getBoundingClientRect();
+  pop.style.visibility = 'hidden';
+  wrap.classList.add('open');
+  let top = rect.bottom + 4;
+  if (top + pop.offsetHeight > window.innerHeight - 8) {
+    top = Math.max(8, rect.top - pop.offsetHeight - 4);
+  }
+  pop.style.top = top + 'px';
+  pop.style.left = Math.max(8, rect.right - pop.offsetWidth) + 'px';
+  pop.style.visibility = '';
+}
+
+// One delegated listener covers every list. The three lists re-render often,
+// so binding per row would mean re-binding on each render.
+function initRowMenus() {
+  document.addEventListener('click', async (e) => {
+    const toggle = e.target.closest('.row-menu-btn');
+    if (toggle) {
+      const wrap = toggle.closest('.row-menu');
+      const wasOpen = wrap === openRowMenu;
+      closeRowMenu();
+      if (!wasOpen) {
+        openRowMenu = wrap;
+        toggle.setAttribute('aria-expanded', 'true');
+        placeRowMenu(wrap);
+      }
+      return;
+    }
+
+    const item = e.target.closest('.row-menu-pop [data-rm-act]');
+    if (!item) { closeRowMenu(); return; }
+
+    const wrap = item.closest('.row-menu');
+    const type = wrap.dataset.rmType;
+    const id = parseInt(wrap.dataset.rmId, 10);
+    const cfg = ROW_MENU_TYPES[type];
+    closeRowMenu();
+    if (!cfg) return;
+    const target = cfg.find(id);
+    if (!target) return;
+
+    switch (item.dataset.rmAct) {
+      case 'pin':
+        if (await setPin(type, id, !target.pinned)) cfg.reload();
+        break;
+      case 'tags':
+        if (await editTags(type, target)) cfg.reload();
+        break;
+      case 'edit': cfg.edit(target); break;
+      case 'del': cfg.remove(target); break;
+    }
+  });
+
+  document.addEventListener('keydown', e => { if (e.key === 'Escape') closeRowMenu(); });
+  // Captured, so scrolling any container - not just the window - dismisses a
+  // popup that would otherwise stay at a stale position.
+  window.addEventListener('scroll', closeRowMenu, true);
+  window.addEventListener('resize', closeRowMenu);
 }
 
 async function setPin(type, id, pinned) {
@@ -1408,24 +1578,6 @@ async function editTags(type, target) {
   return true;
 }
 
-// One wiring pass per rendered list. `lookup` finds the target object by id
-// and `reload` refreshes that list once the change is saved.
-function wirePinTag(root, lookup, reload) {
-  (root || document).querySelectorAll('[data-pin-id]').forEach(b => {
-    b.addEventListener('click', async (e) => {
-      e.stopPropagation();
-      if (await setPin(b.dataset.pinType, parseInt(b.dataset.pinId, 10), b.dataset.pinTo === '1')) reload();
-    });
-  });
-  (root || document).querySelectorAll('[data-tag-id]').forEach(b => {
-    b.addEventListener('click', async (e) => {
-      e.stopPropagation();
-      const t = lookup(parseInt(b.dataset.tagId, 10));
-      if (t && await editTags(b.dataset.tagType, t)) reload();
-    });
-  });
-}
-
 // Rebuilds one "filter by tag" dropdown from whatever tags are in use.
 async function refreshTagFilter(selectId, type, onChange) {
   const sel = document.getElementById(selectId);
@@ -1437,7 +1589,7 @@ async function refreshTagFilter(selectId, type, onChange) {
   } catch (e) { /* leave the list empty */ }
   const keep = tagFilter[type];
   sel.innerHTML = '<option value="">All tags</option>'
-    + tags.map(t => `<option value="${escapeHtml(t.tag)}">${escapeHtml(t.tag)} (${t[type]})</option>`).join('');
+    + tags.map(t => `<option value="${escapeAttr(t.tag)}">${escapeHtml(t.tag)} (${t[type]})</option>`).join('');
   sel.value = tags.some(t => t.tag === keep) ? keep : '';
   tagFilter[type] = sel.value;
   if (!sel.dataset.wired) {
@@ -1450,6 +1602,106 @@ function applyTagFilter(list, type) {
   const want = tagFilter[type];
   if (!want) return list;
   return list.filter(t => (t.tags_list || []).some(x => x.toLowerCase() === want.toLowerCase()));
+}
+
+// ---------------------------------------------------------------------------
+// Tag Manager - the only place a tag can be renamed or removed everywhere at
+// once. Rows are addressed by index rather than by the tag text, so a tag
+// containing a quote cannot break out of an attribute.
+// ---------------------------------------------------------------------------
+let tagManagerTags = [];
+
+async function renderTagManager() {
+  const body = document.getElementById('tagManagerBody');
+  const table = document.getElementById('tagManagerTable');
+  try {
+    tagManagerTags = await (await apiFetch('/api/tags')).json();
+  } catch (e) {
+    tagManagerTags = [];
+  }
+
+  document.getElementById('tagManagerEmpty').style.display = tagManagerTags.length ? 'none' : 'block';
+  table.style.display = tagManagerTags.length ? 'table' : 'none';
+
+  body.innerHTML = tagManagerTags.map((t, i) => `<tr>
+      <td><span class="tag-chip active">${escapeHtml(t.tag)}</span></td>
+      <td>${t.vps}</td>
+      <td>${t.web}</td>
+      <td>${t.ip}</td>
+      <td style="font-weight:600; color:#fff;">${t.total}</td>
+      <td style="text-align:right; white-space:nowrap;">
+        <button type="button" class="row-btn" data-tm="show" data-tm-i="${i}">Show targets</button>
+        <button type="button" class="row-btn" data-tm="rename" data-tm-i="${i}">Rename</button>
+        <button type="button" class="row-btn danger" data-tm="delete" data-tm-i="${i}">Remove</button>
+      </td>
+    </tr>`).join('');
+
+  body.querySelectorAll('[data-tm]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const entry = tagManagerTags[parseInt(btn.dataset.tmI, 10)];
+      if (!entry) return;
+      if (btn.dataset.tm === 'show') return toggleTagTargets(btn.closest('tr'), entry.tag);
+      if (btn.dataset.tm === 'rename') return renameTag(entry.tag);
+      return deleteTag(entry);
+    });
+  });
+}
+
+// Expands one extra row underneath showing what carries the tag; clicking
+// again collapses it.
+async function toggleTagTargets(tr, tag) {
+  const next = tr.nextElementSibling;
+  if (next && next.classList.contains('tag-targets')) { next.remove(); return; }
+
+  let list = [];
+  try {
+    list = await (await apiFetch('/api/tags/targets?tag=' + encodeURIComponent(tag))).json();
+  } catch (e) { /* fall through to the empty message */ }
+
+  const label = { vps: 'VPS', web: 'Web', ip: 'IP' };
+  const inner = list.length
+    ? list.map(x => `<span class="tag-chip">${escapeHtml(label[x.monitor_type] || x.monitor_type)}`
+                  + ` &middot; ${escapeHtml(x.name)}</span>`).join('')
+    : '<span style="color:var(--muted); font-size:11.5px;">Nothing carries this tag.</span>';
+  tr.insertAdjacentHTML('afterend',
+    `<tr class="tag-targets"><td colspan="6">${inner}</td></tr>`);
+}
+
+async function renameTag(tag) {
+  const next = prompt(`Rename "${tag}" on every target that carries it.`, tag);
+  if (next === null || next.trim() === tag) return;
+  const res = await apiFetch('/api/tags/rename', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ tag: tag, new_tag: next })
+  });
+  if (!res.ok) {
+    let msg = 'Could not rename the tag.';
+    try { msg = (await res.json()).error || msg; } catch (e) { /* keep default */ }
+    alert(msg);
+    return;
+  }
+  await afterTagChange();
+}
+
+async function deleteTag(entry) {
+  if (!confirm(`Remove the tag "${entry.tag}" from ${entry.total} target(s)?\n\n`
+             + 'The targets themselves are kept - only the tag goes away.')) return;
+  const res = await apiFetch('/api/tags/delete', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ tag: entry.tag })
+  });
+  if (!res.ok) { alert('Could not remove the tag.'); return; }
+  await afterTagChange();
+}
+
+// A rename or removal touches every list, so the cached copies are refetched
+// rather than left showing tags that no longer exist.
+async function afterTagChange() {
+  await renderTagManager();
+  await Promise.all([loadWebTargets(), loadIpTargets()]);
+  // Last, because it is the call that re-renders Main Monitor - by then the
+  // web and IP arrays behind those cards are already fresh.
+  await loadInstances();
 }
 
 // Detected from the scrape rather than configured, so it's only shown once
@@ -1747,9 +1999,7 @@ function instanceRowHtml(inst, selected, withDelete, withEdit) {
         ${tagChipsHtml(inst)}
       </div>
       <div style="display:flex; gap:6px; flex-shrink:0; align-items:flex-start;">
-        ${withEdit ? pinButtonHtml('vps', inst) + tagButtonHtml('vps', inst) : ''}
-        ${withEdit ? `<button class="del-btn edit-btn" data-edit="${inst.id}" title="Edit">Edit</button>` : ''}
-        ${withDelete ? `<button class="del-btn" data-del="${inst.id}" title="Delete">&times;</button>` : ''}
+        ${(withEdit || withDelete) ? rowMenuHtml('vps', inst, { edit: withEdit, del: withDelete }) : ''}
       </div>
     </div>`;
 }
@@ -1757,6 +2007,12 @@ function escapeHtml(s) {
   const d = document.createElement('div');
   d.textContent = s;
   return d.innerHTML;
+}
+
+// textContent leaves quotes alone, which is fine for text but not for a
+// value that lands inside a double-quoted attribute.
+function escapeAttr(s) {
+  return escapeHtml(s).replace(/"/g, '&quot;');
 }
 
 async function deleteInstance(id) {
@@ -1772,21 +2028,8 @@ async function deleteInstance(id) {
 function wireInstanceRows(box) {
   box.querySelectorAll('.instance-row').forEach(row => {
     row.addEventListener('click', (e) => {
-      if (e.target.closest('.del-btn')) return;
+      if (e.target.closest('.del-btn') || e.target.closest('.row-menu')) return;
       selectInstance(parseInt(row.dataset.id, 10));
-    });
-  });
-  box.querySelectorAll('[data-del]').forEach(btn => {
-    btn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      deleteInstance(parseInt(btn.dataset.del, 10));
-    });
-  });
-  box.querySelectorAll('[data-edit]').forEach(btn => {
-    btn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      const inst = instances.find(i => i.id === parseInt(btn.dataset.edit, 10));
-      if (inst) startEditInstance(inst);
     });
   });
 }
@@ -1811,7 +2054,6 @@ function renderManageList() {
     box.insertAdjacentHTML('beforeend', instanceRowHtml(inst, inst.id === currentInstanceId, true, true));
   });
   wireInstanceRows(box);
-  wirePinTag(box, id => instances.find(i => i.id === id), loadInstances);
   refreshTagFilter('vpsTagFilter', 'vps', renderManageList);
 }
 
@@ -2455,27 +2697,11 @@ function renderIpList() {
       <td>${escapeHtml(l.resolved_ip || '-')}</td>
       <td>${ipStateCell(t)}</td>
       <td style="text-align:right; white-space:nowrap;">
-        ${pinButtonHtml('ip', t)}
-        ${tagButtonHtml('ip', t)}
-        <button type="button" class="row-btn" data-ip-edit="${t.id}">Edit</button>
-        <button type="button" class="row-btn danger" data-ip-del="${t.id}">Delete</button>
+        ${rowMenuHtml('ip', t, { edit: true, del: true })}
       </td>
     </tr>`;
   }).join('');
 
-  document.querySelectorAll('[data-ip-edit]').forEach(b => b.addEventListener('click', () => {
-    const t = ipTargets.find(x => x.id === parseInt(b.dataset.ipEdit, 10));
-    if (t) startEditIp(t);
-  }));
-  document.querySelectorAll('[data-ip-del]').forEach(b => b.addEventListener('click', async () => {
-    const t = ipTargets.find(x => x.id === parseInt(b.dataset.ipDel, 10));
-    if (!t || !confirm(`Stop monitoring "${t.name}" and delete its history?`)) return;
-    await apiFetch('/api/ip-targets/' + t.id, { method: 'DELETE' });
-    await refreshIpTargets();
-  }));
-
-  wirePinTag(document.getElementById('ipTableBody'),
-             id => ipTargets.find(x => x.id === id), refreshIpTargets);
   refreshTagFilter('ipTagFilter', 'ip', renderIpList);
 }
 
@@ -2820,27 +3046,11 @@ function renderWebList() {
       <td>${certCell(l)}</td>
       <td>${webStateCell(t)}</td>
       <td style="text-align:right; white-space:nowrap;">
-        ${pinButtonHtml('web', t)}
-        ${tagButtonHtml('web', t)}
-        <button type="button" class="row-btn" data-web-edit="${t.id}">Edit</button>
-        <button type="button" class="row-btn danger" data-web-del="${t.id}">Delete</button>
+        ${rowMenuHtml('web', t, { edit: true, del: true })}
       </td>
     </tr>`;
   }).join('');
 
-  document.querySelectorAll('[data-web-edit]').forEach(b => b.addEventListener('click', () => {
-    const t = webTargets.find(x => x.id === parseInt(b.dataset.webEdit, 10));
-    if (t) startEditWeb(t);
-  }));
-  document.querySelectorAll('[data-web-del]').forEach(b => b.addEventListener('click', async () => {
-    const t = webTargets.find(x => x.id === parseInt(b.dataset.webDel, 10));
-    if (!t || !confirm(`Stop monitoring "${t.name}" and delete its history?`)) return;
-    await apiFetch('/api/web-targets/' + t.id, { method: 'DELETE' });
-    await refreshWebTargets();
-  }));
-
-  wirePinTag(document.getElementById('webTableBody'),
-             id => webTargets.find(x => x.id === id), refreshWebTargets);
   refreshTagFilter('webTagFilter', 'web', renderWebList);
 }
 
@@ -3030,6 +3240,7 @@ document.getElementById('rangeSelect').addEventListener('change', (e) => {
 });
 
 (async function init() {
+  initRowMenus();
   await loadMe();
   await loadInstances();
   await loadThresholds();

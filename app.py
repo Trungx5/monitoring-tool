@@ -2754,6 +2754,91 @@ def api_tags_set():
     return jsonify({"ok": True, "tags": tags, "tags_list": tag_list(tags)})
 
 
+def _tag_bulk_update(op, tag, new_tag=None):
+    """Renames or removes one tag across all three target tables. Matching is
+    case-insensitive, the same rule normalize_tags() uses when it collapses
+    duplicates, so "company a" and "Company A" are one tag here too."""
+    want = tag.strip().lower()
+    changed = 0
+    conn = db()
+    for table, _ in MONITOR_TABLES.values():
+        rows = conn.execute(
+            "SELECT id, tags FROM %s WHERE tags IS NOT NULL" % table).fetchall()
+        for row in rows:
+            current = tag_list(row["tags"])
+            if not any(t.lower() == want for t in current):
+                continue
+            if op == "rename":
+                updated = [new_tag if t.lower() == want else t for t in current]
+            else:
+                updated = [t for t in current if t.lower() != want]
+            # Back through normalize_tags so a rename onto an existing tag
+            # merges instead of leaving the target with it listed twice.
+            conn.execute("UPDATE %s SET tags = ? WHERE id = ?" % table,
+                         (normalize_tags(updated), row["id"]))
+            changed += 1
+    conn.commit()
+    conn.close()
+    return changed
+
+
+@app.route("/api/tags/targets")
+def api_tags_targets():
+    """Which targets carry one tag - what the tag manager expands to show."""
+    want = (request.args.get("tag") or "").strip().lower()
+    if not want:
+        return jsonify({"error": "tag is required"}), 400
+    out = []
+    conn = db()
+    for monitor_type, (table, _) in MONITOR_TABLES.items():
+        for row in conn.execute(
+                "SELECT id, name, tags FROM %s WHERE tags IS NOT NULL " % table
+                + PINNED_ORDER):
+            if any(t.lower() == want for t in tag_list(row["tags"])):
+                out.append({"monitor_type": monitor_type,
+                            "id": row["id"], "name": row["name"]})
+    conn.close()
+    return jsonify(out)
+
+
+@app.route("/api/tags/rename", methods=["POST"])
+def api_tags_rename():
+    """Renames one tag everywhere it appears. Renaming onto a name already in
+    use merges the two."""
+    data = request.get_json(force=True, silent=True) or {}
+    old = (data.get("tag") or "").strip()
+    raw_new = data.get("new_tag") or ""
+    if "," in raw_new:
+        return jsonify({"error": "a tag cannot contain a comma"}), 400
+    new = normalize_tags(raw_new)
+    if not old or not new:
+        return jsonify({"error": "tag and new_tag are required"}), 400
+
+    changed = _tag_bulk_update("rename", old, new)
+    if not changed:
+        return jsonify({"error": "tag not found"}), 404
+    log_audit("tag.rename", target=old,
+              details="renamed to %s on %d target(s)" % (new, changed))
+    return jsonify({"ok": True, "tag": new, "changed": changed})
+
+
+@app.route("/api/tags/delete", methods=["POST"])
+def api_tags_delete():
+    """Removes one tag from every target that carries it. The targets
+    themselves are untouched."""
+    data = request.get_json(force=True, silent=True) or {}
+    tag = (data.get("tag") or "").strip()
+    if not tag:
+        return jsonify({"error": "tag is required"}), 400
+
+    changed = _tag_bulk_update("remove", tag)
+    if not changed:
+        return jsonify({"error": "tag not found"}), 404
+    log_audit("tag.delete", target=tag,
+              details="removed from %d target(s)" % changed)
+    return jsonify({"ok": True, "changed": changed})
+
+
 @app.route("/api/metrics/latest-all")
 def api_latest_all():
     """Latest sample for every instance in one round trip - the overview grid
