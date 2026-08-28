@@ -2702,8 +2702,9 @@ function otherOverviewCard(t, kind) {
   else note = '<div class="overview-note" style="color:var(--ok);">All checks passing</div>';
 
   return `<div class="overview-card ${cls}" data-other-id="${t.id}">
-    <div class="overview-name">${escapeHtml(t.name)}</div>
+    <div class="overview-name">${escapeHtml(t.name)}${pinBadgeHtml(t)}</div>
     <div class="overview-sub">${escapeHtml(sub)}</div>
+    ${tagChipsHtml(t)}
     <div class="overview-metrics">${metrics}</div>
     ${note}
   </div>`;
