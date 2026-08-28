@@ -90,6 +90,41 @@ _console_handler.setFormatter(_log_formatter)
 logger.addHandler(_console_handler)
 
 
+def normalize_tags(raw):
+    """Accepts a comma-separated string or a list; returns a canonical
+    comma-separated string (or None). Whitespace is collapsed, duplicates
+    are dropped case-insensitively, and the first spelling wins so
+    "Company A" and "company a" cannot both exist on one target."""
+    if raw is None:
+        return None
+    parts = raw if isinstance(raw, (list, tuple)) else str(raw).split(",")
+    seen, out = set(), []
+    for part in parts:
+        tag = " ".join(str(part).split())[:TAG_MAX_LENGTH].strip()
+        if not tag:
+            continue
+        key = tag.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(tag)
+        if len(out) >= TAG_MAX_PER_TARGET:
+            break
+    return ", ".join(out) or None
+
+
+def tag_list(value):
+    """The stored string as a list, for the API and the dashboard."""
+    return [t.strip() for t in (value or "").split(",") if t.strip()]
+
+
+def decorate_pin_tags(target):
+    """Adds the two derived fields every list endpoint exposes."""
+    target["pinned"] = bool(target.get("pinned_at"))
+    target["tags_list"] = tag_list(target.get("tags"))
+    return target
+
+
 def utcnow():
     """Naive UTC 'now'. utcnow() is deprecated, but every timestamp
     already stored in the database - and the format the dashboard parses - is
@@ -102,6 +137,20 @@ SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
 SMTP_USER = os.environ.get("SMTP_USER")
 SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
 ALERT_FROM_EMAIL = os.environ.get("ALERT_FROM_EMAIL", SMTP_USER)
+
+# Pinning and tagging apply to all three monitor types, so the table names
+# and their audit-log prefixes live in one place.
+MONITOR_TABLES = {
+    "vps": ("instances", "instance"),
+    "web": ("web_targets", "web"),
+    "ip": ("ip_targets", "ip"),
+}
+# Sort order shared by all three list queries: pinned first, most recently
+# pinned at the very top, then everything else by insertion order. SQLite
+# sorts NULL first in ASC, hence the explicit "IS NULL" term.
+PINNED_ORDER = "ORDER BY pinned_at IS NULL, pinned_at DESC, id"
+TAG_MAX_PER_TARGET = 8
+TAG_MAX_LENGTH = 40
 
 # Which agent is on the other end of a scrape. Detected from the payload
 # rather than configured per instance - see detect_os_type().
@@ -616,7 +665,9 @@ def _init_db_once():
             last_checked_at TEXT,
             auth_username TEXT,
             auth_password TEXT,
-            os_type TEXT
+            os_type TEXT,
+            pinned_at TEXT,
+            tags TEXT
         )
     """)
 
@@ -754,7 +805,9 @@ def _init_db_once():
             last_status TEXT,
             last_error TEXT,
             last_checked_at TEXT,
-            last_ip TEXT
+            last_ip TEXT,
+            pinned_at TEXT,
+            tags TEXT
         )
     """)
     conn.execute("""
@@ -791,7 +844,9 @@ def _init_db_once():
             last_status TEXT,
             last_error TEXT,
             last_checked_at TEXT,
-            last_ip TEXT
+            last_ip TEXT,
+            pinned_at TEXT,
+            tags TEXT
         )
     """)
     conn.execute("""
@@ -853,6 +908,15 @@ def _init_db_once():
         conn.execute("ALTER TABLE instances ADD COLUMN auth_password TEXT")
     if "os_type" not in inst_cols:
         conn.execute("ALTER TABLE instances ADD COLUMN os_type TEXT")
+
+    # Pinning and tagging arrived after the first releases, so every one of
+    # the three target tables needs the same pair added in place.
+    for table in ("instances", "web_targets", "ip_targets"):
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(%s)" % table).fetchall()]
+        if "pinned_at" not in cols:
+            conn.execute("ALTER TABLE %s ADD COLUMN pinned_at TEXT" % table)
+        if "tags" not in cols:
+            conn.execute("ALTER TABLE %s ADD COLUMN tags TEXT" % table)
 
     sub_cols = [r[1] for r in conn.execute("PRAGMA table_info(alert_subscriptions)").fetchall()]
     if "monitor_type" not in sub_cols:
@@ -964,9 +1028,10 @@ def get_instances(include_secrets=False):
     (the default), so the password never round-trips into a browser response;
     `has_auth` tells the UI whether one is set without revealing it."""
     conn = db()
-    rows = conn.execute("SELECT * FROM instances ORDER BY id").fetchall()
+    rows = conn.execute("SELECT * FROM instances " + PINNED_ORDER).fetchall()
     instances = [dict(r) for r in rows]
     for inst in instances:
+        decorate_pin_tags(inst)
         inst["has_auth"] = bool(inst.get("auth_username"))
         inst["os_label"] = OS_LABELS.get(inst.get("os_type"))
         if not include_secrets:
@@ -1758,10 +1823,11 @@ def maybe_alert(inst, metrics, thresholds, subscriptions):
 # ---------------------------------------------------------------------------
 def get_web_targets():
     conn = db()
-    rows = conn.execute("SELECT * FROM web_targets ORDER BY id").fetchall()
+    rows = conn.execute("SELECT * FROM web_targets " + PINNED_ORDER).fetchall()
     conn.close()
     targets = [dict(r) for r in rows]
     for t in targets:
+        decorate_pin_tags(t)
         t["health"] = evaluate_web_health(t, get_web_latest(t["id"]))
         t["severity"] = {"overall": web_overall_severity(t)}
     return targets
@@ -2120,10 +2186,11 @@ def web_check_loop():
 # ---------------------------------------------------------------------------
 def get_ip_targets():
     conn = db()
-    rows = conn.execute("SELECT * FROM ip_targets ORDER BY id").fetchall()
+    rows = conn.execute("SELECT * FROM ip_targets " + PINNED_ORDER).fetchall()
     conn.close()
     targets = [dict(r) for r in rows]
     for t in targets:
+        decorate_pin_tags(t)
         t["health"] = evaluate_ip_health(t, get_ip_latest(t["id"]))
         t["severity"] = {"overall": ip_overall_severity(t)}
     return targets
@@ -2605,6 +2672,86 @@ def api_instances_delete(instance_id):
     log_audit("instance.delete", target=doomed["name"] if doomed else f"id={instance_id}",
               details="instance and all of its history removed")
     return jsonify({"ok": True})
+
+
+def _resolve_monitor(data):
+    """Shared validation for the pin and tag endpoints: which table, which
+    row, and does that row actually exist."""
+    monitor_type = (data.get("monitor_type") or "").strip().lower()
+    if monitor_type not in MONITOR_TABLES:
+        return None, None, None, (jsonify(
+            {"error": "monitor_type must be one of: vps, web, ip"}), 400)
+    try:
+        target_id = int(data.get("id"))
+    except (TypeError, ValueError):
+        return None, None, None, (jsonify({"error": "id is required"}), 400)
+
+    table, audit_prefix = MONITOR_TABLES[monitor_type]
+    conn = db()
+    row = conn.execute("SELECT id, name FROM %s WHERE id = ?" % table,
+                       (target_id,)).fetchone()
+    if not row:
+        conn.close()
+        return None, None, None, (jsonify({"error": "target not found"}), 404)
+    return conn, (table, audit_prefix), (target_id, row["name"]), None
+
+
+@app.route("/api/pin", methods=["POST"])
+def api_pin():
+    """Pin or unpin one target. The pin timestamp doubles as its priority -
+    the most recently pinned sorts to the very front - so re-pinning an
+    already-pinned target is a meaningful action: it promotes it."""
+    data = request.get_json(force=True, silent=True) or {}
+    conn, meta, ident, err = _resolve_monitor(data)
+    if err:
+        return err
+    table, audit_prefix = meta
+    target_id, name = ident
+
+    pinned = bool(data.get("pinned", True))
+    stamp = utcnow().isoformat() if pinned else None
+    conn.execute("UPDATE %s SET pinned_at = ? WHERE id = ?" % table, (stamp, target_id))
+    conn.commit()
+    conn.close()
+    log_audit("%s.pin" % audit_prefix, target=name,
+              details="pinned" if pinned else "unpinned")
+    return jsonify({"ok": True, "pinned": pinned, "pinned_at": stamp})
+
+
+@app.route("/api/tags", methods=["GET"])
+def api_tags_list():
+    """Every tag in use, with how many targets carry it - the dashboard's
+    filter dropdown is built from this."""
+    counts = {}
+    conn = db()
+    for monitor_type, (table, _) in MONITOR_TABLES.items():
+        for row in conn.execute("SELECT tags FROM %s WHERE tags IS NOT NULL" % table):
+            for tag in tag_list(row["tags"]):
+                entry = counts.setdefault(tag, {"tag": tag, "total": 0,
+                                                "vps": 0, "web": 0, "ip": 0})
+                entry["total"] += 1
+                entry[monitor_type] += 1
+    conn.close()
+    return jsonify(sorted(counts.values(), key=lambda e: (-e["total"], e["tag"].lower())))
+
+
+@app.route("/api/tags", methods=["POST"])
+def api_tags_set():
+    """Replaces the whole tag set on one target. Sending an empty value
+    clears it."""
+    data = request.get_json(force=True, silent=True) or {}
+    conn, meta, ident, err = _resolve_monitor(data)
+    if err:
+        return err
+    table, audit_prefix = meta
+    target_id, name = ident
+
+    tags = normalize_tags(data.get("tags"))
+    conn.execute("UPDATE %s SET tags = ? WHERE id = ?" % table, (tags, target_id))
+    conn.commit()
+    conn.close()
+    log_audit("%s.tag" % audit_prefix, target=name, details=tags or "(cleared)")
+    return jsonify({"ok": True, "tags": tags, "tags_list": tag_list(tags)})
 
 
 @app.route("/api/metrics/latest-all")

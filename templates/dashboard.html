@@ -173,6 +173,21 @@
   }
   /* Which exporter answered - detected from the scrape, not configured. */
   .os-badge { background: rgba(91,141,239,0.12); color: var(--accent); border-color: rgba(91,141,239,0.35); }
+  /* Pinned targets sort to the front; the badge says why. */
+  .pin-badge { background: rgba(230,170,60,0.14); color: #e0a33a; border-color: rgba(230,170,60,0.4); }
+  .pin-btn { width: auto; padding: 0 10px; font-size: 11.5px; }
+  .pin-btn.on { border-color: rgba(230,170,60,0.55); color: #e0a33a; }
+  .pin-btn:hover { border-color: #e0a33a; color: #e0a33a; }
+  /* Free-text labels, e.g. a customer name shared across VPS, web and IP. */
+  .tag-chip {
+    display: inline-block; font-size: 10.5px; padding: 1px 8px; margin: 3px 4px 0 0;
+    border-radius: 999px; background: rgba(139,145,163,0.14);
+    color: var(--muted); border: 1px solid var(--border); white-space: nowrap;
+  }
+  .tag-chip.active { background: rgba(91,141,239,0.16); color: var(--accent); border-color: rgba(91,141,239,0.4); }
+  .tag-filter { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
+  .tag-filter select { width: auto; min-width: 190px; }
+  .tag-filter .hint { font-size: 11.5px; color: var(--muted); }
   .chart-card {
     background: var(--card);
     border: 1px solid var(--border);
@@ -635,6 +650,10 @@
       </div>
 
     <h2 class="section-title">Existing Instances</h2>
+        <div class="tag-filter">
+          <label for="vpsTagFilter" class="hint">Filter by tag</label>
+          <select id="vpsTagFilter"><option value="">All tags</option></select>
+        </div>
         <div class="panel-card" id="manageInstList" style="max-width:560px;">
           <div class="empty-state" id="manageInstEmpty">No instances yet.</div>
         </div>
@@ -673,6 +692,10 @@
         No websites monitored yet. Add one from the <strong>Add Website</strong> tab,
         or bulk-import a CSV with <code>vpsmon web import file.csv</code>.
       </div>
+        <div class="tag-filter">
+          <label for="webTagFilter" class="hint">Filter by tag</label>
+          <select id="webTagFilter"><option value="">All tags</option></select>
+        </div>
       <div class="panel-card" id="webListCard" style="max-width:1000px; display:none;">
         <table class="subs-table" id="webTable">
           <thead><tr>
@@ -775,6 +798,10 @@
       <div id="ipEmpty" class="empty-state" style="display:none; max-width:640px;">
         Nothing monitored yet. Add a host from the <strong>Add IP Address</strong> tab.
       </div>
+        <div class="tag-filter">
+          <label for="ipTagFilter" class="hint">Filter by tag</label>
+          <select id="ipTagFilter"><option value="">All tags</option></select>
+        </div>
       <div class="panel-card" id="ipListCard" style="max-width:1000px; display:none;">
         <table class="subs-table" id="ipTable">
           <thead><tr>
@@ -1328,6 +1355,103 @@ function healthLabelFor(key, osType) {
   return (osType === 'windows' && HEALTH_LABELS_WINDOWS[key]) || HEALTH_LABELS[key];
 }
 
+// ---------------------------------------------------------------------------
+// Pinning and tagging - shared by all three monitor types.
+//
+// The pin timestamp doubles as the priority: the server sorts pinned targets
+// first, most recently pinned at the very top. So pinning something already
+// pinned is meaningful - it promotes it - which is why the button stays
+// active rather than only offering "unpin".
+// ---------------------------------------------------------------------------
+let tagFilter = { vps: '', web: '', ip: '' };
+
+function pinBadgeHtml(t) {
+  return (t && t.pinned) ? ' <span class="auth-badge pin-badge" title="Pinned to the top">PINNED</span>' : '';
+}
+
+function tagChipsHtml(t) {
+  const tags = (t && t.tags_list) || [];
+  if (!tags.length) return '';
+  return '<div>' + tags.map(x => `<span class="tag-chip">${escapeHtml(x)}</span>`).join('') + '</div>';
+}
+
+function pinButtonHtml(type, t) {
+  const on = t.pinned ? ' on' : '';
+  const label = t.pinned ? 'Unpin' : 'Pin';
+  return `<button type="button" class="btn pin-btn${on}" data-pin-type="${type}" `
+       + `data-pin-id="${t.id}" data-pin-to="${t.pinned ? '0' : '1'}">${label}</button>`;
+}
+
+function tagButtonHtml(type, t) {
+  return `<button type="button" class="btn pin-btn" data-tag-type="${type}" data-tag-id="${t.id}">Tags</button>`;
+}
+
+async function setPin(type, id, pinned) {
+  const res = await apiFetch('/api/pin', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ monitor_type: type, id: id, pinned: pinned })
+  });
+  if (!res.ok) { alert('Could not change the pin.'); return false; }
+  return true;
+}
+
+async function editTags(type, target) {
+  const current = ((target.tags_list || []).join(', '));
+  const next = prompt(
+    `Tags for "${target.name}"\nSeparate with commas, e.g.  Company A, Production`, current);
+  if (next === null) return false;
+  const res = await apiFetch('/api/tags', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ monitor_type: type, id: target.id, tags: next })
+  });
+  if (!res.ok) { alert('Could not save the tags.'); return false; }
+  return true;
+}
+
+// One wiring pass per rendered list. `lookup` finds the target object by id
+// and `reload` refreshes that list once the change is saved.
+function wirePinTag(root, lookup, reload) {
+  (root || document).querySelectorAll('[data-pin-id]').forEach(b => {
+    b.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      if (await setPin(b.dataset.pinType, parseInt(b.dataset.pinId, 10), b.dataset.pinTo === '1')) reload();
+    });
+  });
+  (root || document).querySelectorAll('[data-tag-id]').forEach(b => {
+    b.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const t = lookup(parseInt(b.dataset.tagId, 10));
+      if (t && await editTags(b.dataset.tagType, t)) reload();
+    });
+  });
+}
+
+// Rebuilds one "filter by tag" dropdown from whatever tags are in use.
+async function refreshTagFilter(selectId, type, onChange) {
+  const sel = document.getElementById(selectId);
+  if (!sel) return;
+  let tags = [];
+  try {
+    const r = await apiFetch('/api/tags');
+    tags = (await r.json()).filter(t => t[type] > 0);
+  } catch (e) { /* leave the list empty */ }
+  const keep = tagFilter[type];
+  sel.innerHTML = '<option value="">All tags</option>'
+    + tags.map(t => `<option value="${escapeHtml(t.tag)}">${escapeHtml(t.tag)} (${t[type]})</option>`).join('');
+  sel.value = tags.some(t => t.tag === keep) ? keep : '';
+  tagFilter[type] = sel.value;
+  if (!sel.dataset.wired) {
+    sel.dataset.wired = '1';
+    sel.addEventListener('change', () => { tagFilter[type] = sel.value; onChange(); });
+  }
+}
+
+function applyTagFilter(list, type) {
+  const want = tagFilter[type];
+  if (!want) return list;
+  return list.filter(t => (t.tags_list || []).some(x => x.toLowerCase() === want.toLowerCase()));
+}
+
 // Detected from the scrape rather than configured, so it's only shown once
 // an instance has actually reported in.
 function osBadgeHtml(inst) {
@@ -1545,8 +1669,9 @@ function renderOverview() {
     const pct = v => (v === null || v === undefined) ? '--' : v + '%';
 
     return `<div class="overview-card ${cls}" data-id="${inst.id}">
-      <div class="overview-name">${escapeHtml(inst.name)}${osBadgeHtml(inst)}${instanceSeverityPillHtml(inst)}</div>
+      <div class="overview-name">${escapeHtml(inst.name)}${pinBadgeHtml(inst)}${osBadgeHtml(inst)}${instanceSeverityPillHtml(inst)}</div>
       <div class="overview-sub">${escapeHtml(inst.target_url)}</div>
+      ${tagChipsHtml(inst)}
       <div class="overview-metrics">
         ${metric('CPU', down ? '--' : pct(m.cpu_percent))}
         ${metric('Memory', down ? '--' : pct(m.mem_percent))}
@@ -1615,12 +1740,14 @@ function instanceRowHtml(inst, selected, withDelete, withEdit) {
   return `
     <div class="instance-row ${selected ? 'selected' : ''}" data-id="${inst.id}">
       <div>
-        <div class="name">${escapeHtml(inst.name)}${osBadgeHtml(inst)}${inst.has_auth ? ' <span class="auth-badge" title="Basic Auth configured">AUTH</span>' : ''}${instanceSeverityPillHtml(inst)}</div>
+        <div class="name">${escapeHtml(inst.name)}${pinBadgeHtml(inst)}${osBadgeHtml(inst)}${inst.has_auth ? ' <span class="auth-badge" title="Basic Auth configured">AUTH</span>' : ''}${instanceSeverityPillHtml(inst)}</div>
         <div class="url">${escapeHtml(inst.target_url)}</div>
         ${statusLineHtml(inst)}
         ${healthSummaryHtml(inst)}
+        ${tagChipsHtml(inst)}
       </div>
-      <div style="display:flex; gap:6px; flex-shrink:0;">
+      <div style="display:flex; gap:6px; flex-shrink:0; align-items:flex-start;">
+        ${withEdit ? pinButtonHtml('vps', inst) + tagButtonHtml('vps', inst) : ''}
         ${withEdit ? `<button class="del-btn edit-btn" data-edit="${inst.id}" title="Edit">Edit</button>` : ''}
         ${withDelete ? `<button class="del-btn" data-del="${inst.id}" title="Delete">&times;</button>` : ''}
       </div>
@@ -1677,12 +1804,15 @@ function renderSelectList() {
 
 function renderManageList() {
   const box = document.getElementById('manageInstList');
-  document.getElementById('manageInstEmpty').style.display = instances.length ? 'none' : 'block';
+  const shown = applyTagFilter(instances, 'vps');
+  document.getElementById('manageInstEmpty').style.display = shown.length ? 'none' : 'block';
   box.querySelectorAll('.instance-row').forEach(el => el.remove());
-  instances.forEach(inst => {
+  shown.forEach(inst => {
     box.insertAdjacentHTML('beforeend', instanceRowHtml(inst, inst.id === currentInstanceId, true, true));
   });
   wireInstanceRows(box);
+  wirePinTag(box, id => instances.find(i => i.id === id), loadInstances);
+  refreshTagFilter('vpsTagFilter', 'vps', renderManageList);
 }
 
 let editingInstanceId = null;
@@ -2312,18 +2442,21 @@ function renderIpList() {
   document.getElementById('ipListCard').style.display = ipTargets.length ? 'block' : 'none';
   if (!ipTargets.length) return;
 
-  document.getElementById('ipTableBody').innerHTML = ipTargets.map((t, i) => {
+  const shownIp = applyTagFilter(ipTargets, 'ip');
+  document.getElementById('ipTableBody').innerHTML = shownIp.map((t, i) => {
     const l = t.latest || {};
     const check = t.method === 'tcp' ? `TCP ${t.port}` : 'ping';
     return `<tr>
       <td>${i + 1}</td>
-      <td style="font-weight:600; color:#fff;">${escapeHtml(t.name)}</td>
+      <td style="font-weight:600; color:#fff;">${escapeHtml(t.name)}${pinBadgeHtml(t)}${tagChipsHtml(t)}</td>
       <td>${escapeHtml(t.address)}</td>
       <td>${check}</td>
       <td>${l.latency_ms != null ? Math.round(l.latency_ms) + ' ms' : '-'}</td>
       <td>${escapeHtml(l.resolved_ip || '-')}</td>
       <td>${ipStateCell(t)}</td>
       <td style="text-align:right; white-space:nowrap;">
+        ${pinButtonHtml('ip', t)}
+        ${tagButtonHtml('ip', t)}
         <button type="button" class="row-btn" data-ip-edit="${t.id}">Edit</button>
         <button type="button" class="row-btn danger" data-ip-del="${t.id}">Delete</button>
       </td>
@@ -2340,6 +2473,10 @@ function renderIpList() {
     await apiFetch('/api/ip-targets/' + t.id, { method: 'DELETE' });
     await refreshIpTargets();
   }));
+
+  wirePinTag(document.getElementById('ipTableBody'),
+             id => ipTargets.find(x => x.id === id), refreshIpTargets);
+  refreshTagFilter('ipTagFilter', 'ip', renderIpList);
 }
 
 function syncIpPortField() {
@@ -2669,11 +2806,12 @@ function renderWebList() {
   empty.style.display = 'none';
   card.style.display = 'block';
 
-  document.getElementById('webTableBody').innerHTML = webTargets.map((t, i) => {
+  const shownWeb = applyTagFilter(webTargets, 'web');
+  document.getElementById('webTableBody').innerHTML = shownWeb.map((t, i) => {
     const l = t.latest || {};
     return `<tr>
       <td>${i + 1}</td>
-      <td style="font-weight:600; color:#fff;">${escapeHtml(t.name)}</td>
+      <td style="font-weight:600; color:#fff;">${escapeHtml(t.name)}${pinBadgeHtml(t)}${tagChipsHtml(t)}</td>
       <td style="word-break:break-all;">${escapeHtml(t.url)}</td>
       <td>${l.status_code ?? '-'}</td>
       <td>${l.response_ms != null ? Math.round(l.response_ms) + ' ms' : '-'}</td>
@@ -2681,6 +2819,8 @@ function renderWebList() {
       <td>${certCell(l)}</td>
       <td>${webStateCell(t)}</td>
       <td style="text-align:right; white-space:nowrap;">
+        ${pinButtonHtml('web', t)}
+        ${tagButtonHtml('web', t)}
         <button type="button" class="row-btn" data-web-edit="${t.id}">Edit</button>
         <button type="button" class="row-btn danger" data-web-del="${t.id}">Delete</button>
       </td>
@@ -2697,6 +2837,10 @@ function renderWebList() {
     await apiFetch('/api/web-targets/' + t.id, { method: 'DELETE' });
     await refreshWebTargets();
   }));
+
+  wirePinTag(document.getElementById('webTableBody'),
+             id => webTargets.find(x => x.id === id), refreshWebTargets);
+  refreshTagFilter('webTagFilter', 'web', renderWebList);
 }
 
 function startEditWeb(t) {
