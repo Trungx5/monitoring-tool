@@ -930,7 +930,9 @@ def build_parser():
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
-    if args.command != "init" and not os.path.exists(app.DB_PATH):
+    # gen-field-key only prints a new random key - it reads nothing and is the
+    # command you run *before* there is anything to encrypt.
+    if args.command not in ("init", "gen-field-key") and not os.path.exists(app.DB_PATH):
         die(f"no database at {app.DB_PATH} - run 'vpsmon init' first "
             f"(or set DB_PATH to point at an existing one)")
     try:
