@@ -68,6 +68,9 @@ ALERT_FOR_SECONDS = int(os.environ.get("ALERT_FOR_SECONDS", "120"))
 DISK_FORECAST_WINDOW_DAYS = int(os.environ.get("DISK_FORECAST_WINDOW_DAYS", "7"))
 DISK_FORECAST_MIN_SAMPLES = 30      # below this the slope is noise, not a trend
 DISK_FORECAST_MAX_DAYS = 365.0      # further out than this is not a prediction
+# Below this rate the disk is holding steady, not trending. A tenth of a
+# percent a week is indistinguishable from log rotation and temp files.
+DISK_FORECAST_FLAT_PER_DAY = 0.02
 DISK_FORECAST_CACHE_SECONDS = 600
 HEARTBEAT_INTERVAL_SECONDS = int(os.environ.get("HEARTBEAT_INTERVAL_SECONDS", "30"))
 # Websites are checked from the outside and are far less volatile than a
@@ -2885,8 +2888,6 @@ def forecast_disk_full(conn, instance_id, now_epoch):
     if not denom:
         return None
     slope = (n * sxy - sx * sy) / denom          # percent per second
-    if slope <= 0:
-        return None                              # flat or shrinking
 
     latest = conn.execute(
         "SELECT disk_percent FROM metrics WHERE instance_id = ? "
@@ -2896,18 +2897,35 @@ def forecast_disk_full(conn, instance_id, now_epoch):
     if not latest:
         return None
     current = latest["disk_percent"]
-    days = (100.0 - current) / slope / 86400.0
-    if days <= 0 or days > DISK_FORECAST_MAX_DAYS:
-        return None
-    return {"days": round(days, 1),
+    per_day = slope * 86400.0
+
+    # A trend is reported whenever there is enough history to judge one, even
+    # when the answer is "nothing is happening". Reporting only the alarming
+    # case makes silence ambiguous - a steady disk and a broken forecast look
+    # identical on screen, and the operator cannot tell which they have.
+    days = None
+    if per_day <= DISK_FORECAST_FLAT_PER_DAY and per_day >= -DISK_FORECAST_FLAT_PER_DAY:
+        trend = "steady"
+    elif per_day < 0:
+        trend = "draining"
+    else:
+        days = (100.0 - current) / per_day
+        if days <= 0 or days > DISK_FORECAST_MAX_DAYS:
+            trend, days = "steady", None   # fills, but too far out to be news
+        else:
+            trend = "filling"
+
+    return {"trend": trend,
+            "days": None if days is None else round(days, 1),
             "percent": round(current, 1),
-            "per_day": round(slope * 86400.0, 3)}
+            "per_day": round(per_day, 3)}
 
 
 @app.route("/api/forecast/disk")
 def api_forecast_disk():
-    """One entry per instance whose disk is measurably filling up. Cached,
-    because the answer moves over days and the query walks a week of samples."""
+    """One entry per instance with enough disk history to judge a trend -
+    including the ones that are holding steady. Cached, because the answer
+    moves over days and the query walks a week of samples."""
     now = time.time()
     if now - _disk_forecast_cache["at"] < DISK_FORECAST_CACHE_SECONDS:
         return jsonify(_disk_forecast_cache["data"])
@@ -2919,7 +2937,8 @@ def api_forecast_disk():
         if f:
             out.append(dict(f, instance_id=inst["id"], name=inst["name"]))
     conn.close()
-    out.sort(key=lambda e: e["days"])
+    # Soonest to fill first; everything without a date sorts after.
+    out.sort(key=lambda e: e["days"] if e["days"] is not None else float("inf"))
     _disk_forecast_cache.update(at=now, data=out)
     return jsonify(out)
 

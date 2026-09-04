@@ -1964,20 +1964,33 @@ async function loadDiskForecast() {
   } catch (e) { /* keep the previous projection */ }
 }
 
-// Under a week is worth acting on this week; under a month is worth knowing.
-// Anything further out is real but not news, so it stays muted.
+// Shown for every instance with enough history, not only the alarming ones:
+// a steady disk and a forecast that never ran look the same on screen
+// otherwise, and the operator cannot tell which they are looking at.
+// Colour carries the urgency - under a week to act on now, under a month to
+// know about, everything else stays muted.
 function forecastNoteHtml(instanceId) {
   const f = diskForecast[instanceId];
   if (!f) return '';
+
+  // Three decimals is what the fit produces; one is what a person reads.
+  const rate = v => Number(Math.abs(v).toFixed(Math.abs(v) >= 1 ? 1 : 2));
+
+  if (f.trend !== 'filling') {
+    const label = f.trend === 'draining'
+      ? `Disk freeing up &middot; &minus;${rate(f.per_day)}%/day`
+      : 'Disk steady &middot; no growth';
+    return `<div class="forecast-note" style="color:var(--muted);">`
+         + `<span>${f.percent}% used</span><span>&middot;</span><span>${label}</span></div>`;
+  }
+
   const colour = f.days <= 7 ? 'var(--bad)' : (f.days <= 30 ? 'var(--warn)' : 'var(--muted)');
   const when = f.days < 1
     ? 'less than a day'
     : `${f.days < 10 ? f.days : Math.round(f.days)} day${f.days >= 2 ? 's' : ''}`;
-  // Three decimals is what the fit produces; one is what a person reads.
-  const rate = Number(f.per_day.toFixed(f.per_day >= 1 ? 1 : 2));
   return `<div class="forecast-note" style="color:${colour};">`
        + `<span>Disk full in</span><span class="days">${when}</span>`
-       + `<span style="color:var(--muted);">&middot; +${rate}%/day</span></div>`;
+       + `<span style="color:var(--muted);">&middot; +${rate(f.per_day)}%/day</span></div>`;
 }
 
 async function loadOverviewMetrics() {
