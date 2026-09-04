@@ -160,6 +160,10 @@
   .stat-label { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
   .stat-value { font-size: 30px; font-weight: 700; margin-top: 6px; }
   .stat-sub { font-size: 12px; color: var(--muted); margin-top: 4px; }
+  /* The projection sits under the measured figure and never outshouts it:
+     it is an extrapolation, and it says so by being the quieter line. */
+  #diskTrend:empty { display: none; }
+  #diskTrend { font-weight: 600; }
   .severity-pill {
     font-size: 10px; font-weight: 700; letter-spacing: 0.04em;
     padding: 2px 7px; border-radius: 999px; margin-left: 8px;
@@ -566,6 +570,7 @@
               <div class="stat-label">Disk</div>
               <div class="stat-value" id="diskValue">--</div>
               <div class="stat-sub" id="diskSub">--</div>
+              <div class="stat-sub" id="diskTrend"></div>
             </div>
             <div class="stat-card" id="card-bw">
               <div class="stat-label">Bandwidth</div>
@@ -1957,11 +1962,42 @@ let overviewMetrics = {};
 // rather than getting a timer of its own.
 let diskForecast = {};
 
-async function loadDiskForecast() {
+// The server recomputes at most every ten minutes, so refetching on the 5s
+// stats poll would be pure request noise. Throttled here so every caller can
+// ask freely without thinking about it.
+let diskForecastFetchedAt = 0;
+
+async function loadDiskForecast(force) {
+  const now = Date.now();
+  if (!force && now - diskForecastFetchedAt < 120000) return;
+  diskForecastFetchedAt = now;
   try {
     const list = await (await apiFetch('/api/forecast/disk')).json();
     diskForecast = Object.fromEntries(list.map(f => [f.instance_id, f]));
-  } catch (e) { /* keep the previous projection */ }
+  } catch (e) {
+    diskForecastFetchedAt = 0;   // let the next caller retry
+  }
+}
+
+// Same three trends as the overview card, as a plain string plus the colour
+// the single-instance stat card should use.
+function forecastText(instanceId) {
+  const f = diskForecast[instanceId];
+  if (!f) return null;
+  const rate = v => Number(Math.abs(v).toFixed(Math.abs(v) >= 1 ? 1 : 2));
+  if (f.trend === 'draining') {
+    return { text: `Freeing up \u2212${rate(f.per_day)}%/day`, colour: 'var(--muted)' };
+  }
+  if (f.trend === 'steady') {
+    return { text: 'Steady \u00b7 no growth', colour: 'var(--muted)' };
+  }
+  const when = f.days < 1
+    ? 'less than a day'
+    : `${f.days < 10 ? f.days : Math.round(f.days)} day${f.days >= 2 ? 's' : ''}`;
+  return {
+    text: `Full in ${when} \u00b7 +${rate(f.per_day)}%/day`,
+    colour: f.days <= 7 ? 'var(--bad)' : (f.days <= 30 ? 'var(--warn)' : 'var(--muted)'),
+  };
 }
 
 // Shown for every instance with enough history, not only the alarming ones:
@@ -3175,6 +3211,7 @@ function blankStats(errorMessage) {
   document.getElementById('memSub').textContent = '--';
   document.getElementById('diskValue').textContent = '--';
   document.getElementById('diskSub').textContent = '--';
+  document.getElementById('diskTrend').textContent = '';
   document.getElementById('bwValue').textContent = '--';
   document.getElementById('bwSub').textContent = 'rx/s · tx/s';
   document.getElementById('diskioValue').textContent = '--';
@@ -3223,6 +3260,14 @@ async function refreshLatest() {
 
     document.getElementById('diskValue').textContent = m.disk_percent + '%';
     document.getElementById('diskSub').textContent = m.disk_used_gb + ' / ' + m.disk_total_gb + ' GB';
+
+    // Fire and forget: the first paint uses whatever projection is cached,
+    // and the fetch (throttled to once every two minutes) updates the next.
+    loadDiskForecast();
+    const trend = forecastText(currentInstanceId);
+    const trendEl = document.getElementById('diskTrend');
+    trendEl.textContent = trend ? trend.text : '';
+    trendEl.style.color = trend ? trend.colour : '';
     setSeverityClass('card-disk', severityFor(m.disk_percent, thresholds.disk_warn, thresholds.disk_crit));
 
     document.getElementById('bwValue').textContent = fmtBps(m.net_rx_bps) + ' ↓ / ' + fmtBps(m.net_tx_bps) + ' ↑';
