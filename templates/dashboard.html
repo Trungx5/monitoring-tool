@@ -453,6 +453,13 @@
   .overview-metric .k { font-size: 10.5px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
   .overview-metric .v { font-size: 17px; font-weight: 600; margin-top: 2px; }
   .overview-note { font-size: 11.5px; margin-top: 12px; }
+  /* The forecast is a second, quieter line - it is a projection, not a
+     measurement, so it never outranks the current health note above it. */
+  .forecast-note {
+    font-size: 11.5px; margin-top: 6px;
+    display: flex; align-items: baseline; gap: 6px;
+  }
+  .forecast-note .days { font-weight: 600; }
 </style>
 </head>
 <body>
@@ -1924,6 +1931,7 @@ function renderOverview() {
       <div class="overview-name">${escapeHtml(inst.name)}${pinBadgeHtml(inst)}${osBadgeHtml(inst)}${instanceSeverityPillHtml(inst)}</div>
       <div class="overview-sub">${escapeHtml(inst.target_url)}</div>
       ${tagChipsHtml(inst)}
+      ${forecastNoteHtml(inst.id)}
       <div class="overview-metrics">
         ${metric('CPU', down ? '--' : pct(m.cpu_percent))}
         ${metric('Memory', down ? '--' : pct(m.mem_percent))}
@@ -1944,6 +1952,34 @@ function renderOverview() {
 
 // Latest sample per instance, used only by the overview cards.
 let overviewMetrics = {};
+// Disk-fill projections, keyed by instance id. The server recomputes these
+// at most every ten minutes, so this rides along with the overview poll
+// rather than getting a timer of its own.
+let diskForecast = {};
+
+async function loadDiskForecast() {
+  try {
+    const list = await (await apiFetch('/api/forecast/disk')).json();
+    diskForecast = Object.fromEntries(list.map(f => [f.instance_id, f]));
+  } catch (e) { /* keep the previous projection */ }
+}
+
+// Under a week is worth acting on this week; under a month is worth knowing.
+// Anything further out is real but not news, so it stays muted.
+function forecastNoteHtml(instanceId) {
+  const f = diskForecast[instanceId];
+  if (!f) return '';
+  const colour = f.days <= 7 ? 'var(--bad)' : (f.days <= 30 ? 'var(--warn)' : 'var(--muted)');
+  const when = f.days < 1
+    ? 'less than a day'
+    : `${f.days < 10 ? f.days : Math.round(f.days)} day${f.days >= 2 ? 's' : ''}`;
+  // Three decimals is what the fit produces; one is what a person reads.
+  const rate = Number(f.per_day.toFixed(f.per_day >= 1 ? 1 : 2));
+  return `<div class="forecast-note" style="color:${colour};">`
+       + `<span>Disk full in</span><span class="days">${when}</span>`
+       + `<span style="color:var(--muted);">&middot; +${rate}%/day</span></div>`;
+}
+
 async function loadOverviewMetrics() {
   if (!document.getElementById('view-main').classList.contains('active')) return;
   if (mainType !== 'vps' || mainTargetId !== null) return;
@@ -1953,6 +1989,7 @@ async function loadOverviewMetrics() {
     overviewMetrics = Object.fromEntries(
       Object.entries(all).filter(([, v]) => v));
   } catch (e) { /* keep whatever we had */ }
+  await loadDiskForecast();
   renderOverview();
 }
 

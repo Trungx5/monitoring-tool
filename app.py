@@ -41,7 +41,7 @@ from logging.handlers import RotatingFileHandler
 from urllib.parse import urlsplit
 
 import requests
-from flask import (Flask, g, has_request_context, jsonify, redirect,
+from flask import (Flask, Response, g, has_request_context, jsonify, redirect,
                    render_template, request, session, url_for)
 from werkzeug.security import check_password_hash, generate_password_hash
 
@@ -54,6 +54,21 @@ from werkzeug.security import check_password_hash, generate_password_hash
 DEFAULT_TARGET_URL = os.environ.get("DEFAULT_TARGET_URL", "")
 # Tunable so a small device can trade resolution for far fewer disk writes.
 SCRAPE_INTERVAL_SECONDS = int(os.environ.get("SCRAPE_INTERVAL_SECONDS", "10"))
+
+# How long a metric or health check must hold its new state before an email
+# goes out. Without this, a single bad scrape during a backup or a deploy
+# produces a FAILING mail followed by a recovered mail a few seconds later -
+# the flapping that trains people to filter the alerts away entirely.
+# Applied symmetrically: a blip in either direction is ignored rather than
+# generating a matched pair of emails. Set to 0 for the old behaviour of
+# alerting on the first differing scrape.
+ALERT_FOR_SECONDS = int(os.environ.get("ALERT_FOR_SECONDS", "120"))
+
+# Disk-fill forecast: fit a line to recent disk usage and extrapolate to 100%.
+DISK_FORECAST_WINDOW_DAYS = int(os.environ.get("DISK_FORECAST_WINDOW_DAYS", "7"))
+DISK_FORECAST_MIN_SAMPLES = 30      # below this the slope is noise, not a trend
+DISK_FORECAST_MAX_DAYS = 365.0      # further out than this is not a prediction
+DISK_FORECAST_CACHE_SECONDS = 600
 HEARTBEAT_INTERVAL_SECONDS = int(os.environ.get("HEARTBEAT_INTERVAL_SECONDS", "30"))
 # Websites are checked from the outside and are far less volatile than a
 # server's CPU, so they get a slower cadence - and hammering someone else's
@@ -88,6 +103,94 @@ logger.addHandler(_file_handler)
 _console_handler = logging.StreamHandler()
 _console_handler.setFormatter(_log_formatter)
 logger.addHandler(_console_handler)
+
+
+# ---------------------------------------------------------------------------
+# Encryption for the one secret that cannot be hashed.
+#
+# Basic Auth requires replaying the actual password to the exporter, so
+# auth_password cannot be stored as a digest the way user passwords are. It is
+# encrypted instead, with the key held in the environment rather than in the
+# database - which is what makes a stolen database file (a leaked backup, a
+# provider snapshot, a decommissioned disk) useless on its own.
+#
+# It does NOT defend against someone who already has root on a running box:
+# the process must be able to read the key. That is the honest boundary.
+#
+# Values carry a version prefix so plaintext rows from before this change stay
+# readable, the migration can run more than once safely, and re-saving an
+# already-encrypted value never double-encrypts it.
+# ---------------------------------------------------------------------------
+FIELD_KEY = os.environ.get("FIELD_KEY", "").strip()
+_ENC_PREFIX = "enc:v1:"
+_fernet = None
+_field_key_warned = False
+
+
+def _get_fernet():
+    """Built once, lazily - importing cryptography costs ~40ms and most
+    deployments have no encrypted fields to read."""
+    global _fernet, _field_key_warned
+    if not FIELD_KEY:
+        if not _field_key_warned:
+            _field_key_warned = True
+            logger.warning(
+                "FIELD_KEY is not set - exporter passwords are stored in the "
+                "clear. Generate one with: python cli.py gen-field-key")
+        return None
+    if _fernet is None:
+        from cryptography.fernet import Fernet
+        _fernet = Fernet(FIELD_KEY.encode())
+    return _fernet
+
+
+def encrypt_secret(value):
+    """Idempotent: an already-encrypted value passes through untouched, so the
+    edit endpoint can write back a row it never decrypted."""
+    if not value or value.startswith(_ENC_PREFIX):
+        return value
+    f = _get_fernet()
+    if f is None:
+        return value
+    return _ENC_PREFIX + f.encrypt(value.encode()).decode()
+
+
+def decrypt_secret(value):
+    """Unprefixed values are pre-encryption rows and are returned as-is."""
+    if not value or not value.startswith(_ENC_PREFIX):
+        return value
+    f = _get_fernet()
+    if f is None:
+        logger.error("Found an encrypted password but FIELD_KEY is not set")
+        return None
+    try:
+        return f.decrypt(value[len(_ENC_PREFIX):].encode()).decode()
+    except Exception as e:
+        logger.error(f"Could not decrypt a stored password: {e}")
+        return None
+
+
+def encrypt_existing_secrets():
+    """Brings pre-encryption rows up to date. Runs on every start; a no-op
+    once there is nothing left in the clear."""
+    if not _get_fernet():
+        return 0
+    conn = db()
+    rows = conn.execute(
+        "SELECT id, auth_password FROM instances WHERE auth_password IS NOT NULL"
+    ).fetchall()
+    done = 0
+    for row in rows:
+        if row["auth_password"].startswith(_ENC_PREFIX):
+            continue
+        conn.execute("UPDATE instances SET auth_password = ? WHERE id = ?",
+                     (encrypt_secret(row["auth_password"]), row["id"]))
+        done += 1
+    if done:
+        conn.commit()
+        logger.info(f"Encrypted {done} stored exporter password(s)")
+    conn.close()
+    return done
 
 
 def normalize_tags(raw):
@@ -296,7 +399,7 @@ ROLE_ADMIN = "admin"
 ROLE_VIEWER = "viewer"
 ROLES = (ROLE_ADMIN, ROLE_VIEWER)
 
-PUBLIC_ENDPOINTS = {"login", "static"}
+PUBLIC_ENDPOINTS = {"login", "static", "install_agent"}
 LOGIN_MAX_ATTEMPTS = 5
 LOGIN_WINDOW_SECONDS = 300
 SESSION_LIFETIME_HOURS = int(os.environ.get("SESSION_LIFETIME_HOURS", "12"))
@@ -572,6 +675,22 @@ def require_login():
         if request.path.startswith("/api/"):
             return jsonify({"error": "admin role required for this action"}), 403
         return jsonify({"error": "admin role required for this action"}), 403
+
+
+@app.route("/install-agent.sh")
+def install_agent():
+    """Serves the agent installer so onboarding is one command instead of a
+    page of instructions. Public by design - the same way every other install
+    script is fetched - and it carries no secrets: the exporter password is
+    generated on the machine being installed, and printed there for the
+    operator to paste back into the dashboard."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "deploy", "install-agent.sh")
+    if not os.path.exists(path):
+        return Response("installer not found\n", status=404, mimetype="text/plain")
+    with open(path, encoding="utf-8") as fh:
+        body = fh.read()
+    return Response(body, mimetype="text/x-shellscript")
 
 
 @app.route("/login", methods=["GET", "POST"])
@@ -977,6 +1096,9 @@ def _init_db_once():
             conn.rollback()  # another starting process seeded it first
 
     conn.close()
+    # Brings any pre-encryption rows up to date. Both the web service and the
+    # scraper call init_db(), so whichever starts first does the work.
+    encrypt_existing_secrets()
     bootstrap_admin_user()
 
 
@@ -1033,6 +1155,10 @@ def get_instances(include_secrets=False):
     for inst in instances:
         decorate_pin_tags(inst)
         inst["has_auth"] = bool(inst.get("auth_username"))
+        # Callers that asked for secrets get the usable password, not the
+        # stored ciphertext - the scraper should not know encryption exists.
+        if include_secrets and inst.get("auth_password"):
+            inst["auth_password"] = decrypt_secret(inst["auth_password"])
         inst["os_label"] = OS_LABELS.get(inst.get("os_type"))
         if not include_secrets:
             inst.pop("auth_password", None)
@@ -1729,6 +1855,33 @@ def evaluate_health(inst, history):
     return checks
 
 
+# A state that differs from the last confirmed one, and when it was first
+# seen. Keyed by (kind, target id, check name). Lives in memory in the single
+# scraper process, so a restart simply re-arms every dwell window - which is
+# the safe direction: no alert storm on restart.
+_pending_alert = {}
+
+
+def dwell_passed(slot, observed, now):
+    """True once `observed` has held continuously for ALERT_FOR_SECONDS.
+
+    A different state arriving mid-window restarts the clock, so a value that
+    oscillates between good and critical never reaches the threshold and never
+    sends anything - which is the entire point."""
+    pend = _pending_alert.get(slot)
+    if pend is None or pend[0] != observed:
+        pend = [observed, now]
+        _pending_alert[slot] = pend
+    if now - pend[1] >= ALERT_FOR_SECONDS:
+        del _pending_alert[slot]
+        return True
+    return False
+
+
+def clear_dwell(slot):
+    _pending_alert.pop(slot, None)
+
+
 # Last known health checklist per instance, so we only email on transitions
 # (a check newly failing, or newly recovering) rather than every scrape.
 _prev_health = {}
@@ -1736,15 +1889,22 @@ _prev_health = {}
 
 def maybe_alert_health(inst, health, subscriptions):
     iid = inst["id"]
-    previous = _prev_health.get(iid, {})
-    _prev_health[iid] = dict(health)
+    confirmed = _prev_health.setdefault(iid, {})
+    now = time.monotonic()
 
     for key, val in health.items():
-        old = previous.get(key)
-        if val is None or old == val:
+        old = confirmed.get(key)
+        if val is None:
+            continue
+        if old == val:
+            clear_dwell(("health", iid, key))
             continue
         if old is None and val is True:
-            continue  # first real reading being healthy isn't a "transition"
+            confirmed[key] = val  # first real reading being healthy isn't a "transition"
+            continue
+        if not dwell_passed(("health", iid, key), val, now):
+            continue
+        confirmed[key] = val
 
         label = ALERT_TYPE_LABELS[key]
         log_event("info" if val else "error", "health",
@@ -1787,16 +1947,23 @@ _prev_severity = {}
 def maybe_alert(inst, metrics, thresholds, subscriptions):
     result = evaluate_severity(metrics, thresholds)
     iid = inst["id"]
-    previous = _prev_severity.get(iid, {})
-    _prev_severity[iid] = dict(result["metrics"])
+    confirmed = _prev_severity.setdefault(iid, {})
+    now = time.monotonic()
 
     for key, (label, unit, getter) in METRIC_DEFS.items():
         sev = result["metrics"].get(key)
-        old = previous.get(key)
-        if sev is None or sev == old:
+        old = confirmed.get(key)
+        if sev is None:
+            continue
+        if sev == old:
+            clear_dwell(("vps", iid, key))
             continue
         if old is None and sev == "good":
-            continue  # first real reading being fine isn't a "transition"
+            confirmed[key] = sev  # first real reading being fine isn't a "transition"
+            continue
+        if not dwell_passed(("vps", iid, key), sev, now):
+            continue
+        confirmed[key] = sev
 
         value = getter(metrics)
         alert_label = ALERT_TYPE_LABELS[key]
@@ -2577,7 +2744,7 @@ def api_instances_create():
         cur = conn.execute(
             "INSERT INTO instances (name, target_url, created_at, auth_username, auth_password) "
             "VALUES (?, ?, ?, ?, ?)",
-            (name, url, utcnow().isoformat(), auth_username, auth_password)
+            (name, url, utcnow().isoformat(), auth_username, encrypt_secret(auth_password))
         )
         conn.commit()
         new_id = cur.lastrowid
@@ -2635,7 +2802,7 @@ def api_instances_update(instance_id):
         conn.execute(
             "UPDATE instances SET name = ?, target_url = ?, auth_username = ?, "
             "auth_password = ?, os_type = ? WHERE id = ?",
-            (name, url, auth_username, auth_password, os_type, instance_id)
+            (name, url, auth_username, encrypt_secret(auth_password), os_type, instance_id)
         )
         conn.commit()
     except sqlite3.IntegrityError:
@@ -2669,9 +2836,92 @@ def api_instances_delete(instance_id):
     _prev_state.pop(instance_id, None)
     _prev_severity.pop(instance_id, None)
     _prev_health.pop(instance_id, None)
+    for slot in [s for s in _pending_alert if s[1] == instance_id]:
+        del _pending_alert[slot]
+    _prev_health.pop(instance_id, None)
     log_audit("instance.delete", target=doomed["name"] if doomed else f"id={instance_id}",
               details="instance and all of its history removed")
     return jsonify({"ok": True})
+
+
+_disk_forecast_cache = {"at": 0.0, "data": []}
+
+
+def forecast_disk_full(conn, instance_id, now_epoch):
+    """Days until disk_percent reaches 100, by least squares over the recent
+    window. Returns None when the disk is flat or shrinking, when there is too
+    little history to be honest about a trend, or when the answer is so far
+    out that it says nothing.
+
+    The sums are computed in SQL rather than in Python: it avoids parsing tens
+    of thousands of timestamp strings, and the query rides the existing
+    (instance_id, timestamp) index. Time is offset to the window start before
+    squaring - epoch seconds squared lose enough precision in a float that the
+    two large near-equal terms of the slope cancel into noise."""
+    t0 = now_epoch - DISK_FORECAST_WINDOW_DAYS * 86400
+    row = conn.execute(
+        """
+        SELECT COUNT(*)   AS n,
+               SUM(x)     AS sx,
+               SUM(y)     AS sy,
+               SUM(x * y) AS sxy,
+               SUM(x * x) AS sxx
+        FROM (
+            SELECT CAST(strftime('%s', timestamp) AS REAL) - ? AS x,
+                   disk_percent                              AS y
+            FROM metrics
+            WHERE instance_id = ? AND timestamp >= ? AND disk_percent IS NOT NULL
+        )
+        """,
+        (t0, instance_id,
+         datetime.fromtimestamp(t0, timezone.utc).replace(tzinfo=None).isoformat()),
+    ).fetchone()
+
+    if not row or not row["n"] or row["n"] < DISK_FORECAST_MIN_SAMPLES:
+        return None
+
+    n, sx, sy, sxy, sxx = row["n"], row["sx"], row["sy"], row["sxy"], row["sxx"]
+    denom = n * sxx - sx * sx
+    if not denom:
+        return None
+    slope = (n * sxy - sx * sy) / denom          # percent per second
+    if slope <= 0:
+        return None                              # flat or shrinking
+
+    latest = conn.execute(
+        "SELECT disk_percent FROM metrics WHERE instance_id = ? "
+        "AND disk_percent IS NOT NULL ORDER BY id DESC LIMIT 1",
+        (instance_id,),
+    ).fetchone()
+    if not latest:
+        return None
+    current = latest["disk_percent"]
+    days = (100.0 - current) / slope / 86400.0
+    if days <= 0 or days > DISK_FORECAST_MAX_DAYS:
+        return None
+    return {"days": round(days, 1),
+            "percent": round(current, 1),
+            "per_day": round(slope * 86400.0, 3)}
+
+
+@app.route("/api/forecast/disk")
+def api_forecast_disk():
+    """One entry per instance whose disk is measurably filling up. Cached,
+    because the answer moves over days and the query walks a week of samples."""
+    now = time.time()
+    if now - _disk_forecast_cache["at"] < DISK_FORECAST_CACHE_SECONDS:
+        return jsonify(_disk_forecast_cache["data"])
+
+    out = []
+    conn = db()
+    for inst in conn.execute("SELECT id, name FROM instances").fetchall():
+        f = forecast_disk_full(conn, inst["id"], now)
+        if f:
+            out.append(dict(f, instance_id=inst["id"], name=inst["name"]))
+    conn.close()
+    out.sort(key=lambda e: e["days"])
+    _disk_forecast_cache.update(at=now, data=out)
+    return jsonify(out)
 
 
 def _resolve_monitor(data):

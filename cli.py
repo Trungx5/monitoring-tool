@@ -22,6 +22,7 @@ import getpass
 import os
 import sqlite3
 import sys
+import time
 
 import app
 
@@ -666,6 +667,43 @@ def cmd_audit(args):
 # ---------------------------------------------------------------------------
 # init
 # ---------------------------------------------------------------------------
+def cmd_gen_field_key(args):
+    """Prints a fresh key for FIELD_KEY. Encrypting the exporter passwords
+    needs a key that lives outside the database - that separation is the whole
+    point, so the key goes in the env file, never in a table."""
+    from cryptography.fernet import Fernet
+    key = Fernet.generate_key().decode()
+    print(key)
+    print("", file=sys.stderr)
+    print("Add this to your env file, then restart the services:", file=sys.stderr)
+    print(f"  FIELD_KEY={key}", file=sys.stderr)
+    print("", file=sys.stderr)
+    print("Keep a copy somewhere safe. Losing it means every stored exporter",
+          file=sys.stderr)
+    print("password has to be re-entered by hand.", file=sys.stderr)
+    return 0
+
+
+def cmd_forecast(args):
+    """Which disks are filling, soonest first."""
+    conn = app.db()
+    rows = []
+    for inst in conn.execute("SELECT id, name FROM instances").fetchall():
+        f = app.forecast_disk_full(conn, inst["id"], time.time())
+        if f:
+            rows.append((f["days"], inst["name"], f))
+    conn.close()
+    if not rows:
+        print("No disk is measurably filling up.")
+        return 0
+    rows.sort()
+    print(f"{'INSTANCE':<28} {'NOW':>7} {'PER DAY':>9} {'FULL IN':>10}")
+    for days, name, f in rows:
+        print(f"{name[:28]:<28} {f['percent']:>6.1f}% {f['per_day']:>8.3f}% "
+              f"{days:>7.1f}d")
+    return 0
+
+
 def cmd_init(args):
     # init_db() creates the schema and bootstraps the first admin itself, so
     # count accounts beforehand to report accurately rather than calling the
@@ -702,6 +740,12 @@ def build_parser():
                    help="also invalidate every existing login session")
     p.set_defaults(func=cmd_init)
     sub.add_parser("status", help="one-line health summary of every instance").set_defaults(func=cmd_status)
+    sub.add_parser("gen-field-key",
+                   help="print a new FIELD_KEY for encrypting exporter passwords"
+                   ).set_defaults(func=cmd_gen_field_key)
+    sub.add_parser("forecast",
+                   help="show which disks are filling up and how soon"
+                   ).set_defaults(func=cmd_forecast)
 
     # --- instance ---
     inst = sub.add_parser("instance", help="add, edit, list or remove monitored servers")
