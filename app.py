@@ -178,21 +178,20 @@ def encrypt_existing_secrets():
     once there is nothing left in the clear."""
     if not _get_fernet():
         return 0
-    conn = db()
-    rows = conn.execute(
-        "SELECT id, auth_password FROM instances WHERE auth_password IS NOT NULL"
-    ).fetchall()
-    done = 0
-    for row in rows:
-        if row["auth_password"].startswith(_ENC_PREFIX):
-            continue
-        conn.execute("UPDATE instances SET auth_password = ? WHERE id = ?",
-                     (encrypt_secret(row["auth_password"]), row["id"]))
-        done += 1
-    if done:
-        conn.commit()
-        logger.info(f"Encrypted {done} stored exporter password(s)")
-    conn.close()
+    with Db() as conn:
+        rows = conn.execute(
+            "SELECT id, auth_password FROM instances WHERE auth_password IS NOT NULL"
+        ).fetchall()
+        done = 0
+        for row in rows:
+            if row["auth_password"].startswith(_ENC_PREFIX):
+                continue
+            conn.execute("UPDATE instances SET auth_password = ? WHERE id = ?",
+                         (encrypt_secret(row["auth_password"]), row["id"]))
+            done += 1
+        if done:
+            conn.commit()
+            logger.info(f"Encrypted {done} stored exporter password(s)")
     return done
 
 
@@ -429,21 +428,64 @@ def db():
     return conn
 
 
+class Db:
+    """Opens a connection for the duration of a block.
+
+    `db()` hands back a bare connection that the caller has to remember to
+    close, and the close only runs on the success path - so anything raised in
+    between leaves the handle to the garbage collector, and a half-finished
+    multi-statement write is left to be rolled back by whoever notices.
+
+    This closes either way, and with `commit=True` commits on a clean exit and
+    rolls back on an exception, so a write that fails part-way never lands.
+    """
+    __slots__ = ("_commit", "conn")
+
+    def __init__(self, commit=False):
+        self._commit = commit
+        self.conn = None
+
+    def __enter__(self):
+        self.conn = db()
+        return self.conn
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if exc_type is None:
+                if self._commit:
+                    self.conn.commit()
+            else:
+                self.conn.rollback()
+        finally:
+            self.conn.close()
+        return False
+
+
+def optional_int(data, key):
+    """A form field that is allowed to be absent, blank, or not a number at
+    all - all three mean "not set" rather than an error. Defined once because
+    every optional numeric field on every target form wants exactly this."""
+    value = data.get(key)
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def get_app_state(key, default=None):
-    conn = db()
-    row = conn.execute("SELECT value FROM app_state WHERE key = ?", (key,)).fetchone()
-    conn.close()
+    with Db() as conn:
+        row = conn.execute("SELECT value FROM app_state WHERE key = ?", (key,)).fetchone()
     return row["value"] if row else default
 
 
 def set_app_state(key, value):
-    conn = db()
-    conn.execute(
-        "INSERT INTO app_state (key, value) VALUES (?, ?) "
-        "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (key, value)
-    )
-    conn.commit()
-    conn.close()
+    with Db(commit=True) as conn:
+        conn.execute(
+            "INSERT INTO app_state (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (key, value)
+        )
 
 
 def mark_server_start():
@@ -463,63 +505,56 @@ def current_boot_id():
 # User records
 # ---------------------------------------------------------------------------
 def get_user_by_username(username):
-    conn = db()
-    row = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
-    conn.close()
+    with Db() as conn:
+        row = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
     return dict(row) if row else None
 
 
 def get_user(user_id):
-    conn = db()
-    row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
-    conn.close()
+    with Db() as conn:
+        row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
     return dict(row) if row else None
 
 
 def list_users():
-    conn = db()
-    rows = conn.execute(
-        "SELECT id, username, role, is_active, created_at, last_login_at "
-        "FROM users ORDER BY id"
-    ).fetchall()
-    conn.close()
+    with Db() as conn:
+        rows = conn.execute(
+            "SELECT id, username, role, is_active, created_at, last_login_at "
+            "FROM users ORDER BY id"
+        ).fetchall()
     return [dict(r) for r in rows]
 
 
 def count_admins(exclude_user_id=None):
-    conn = db()
-    if exclude_user_id is None:
-        row = conn.execute(
-            "SELECT COUNT(*) c FROM users WHERE role = ? AND is_active = 1", (ROLE_ADMIN,)
-        ).fetchone()
-    else:
-        row = conn.execute(
-            "SELECT COUNT(*) c FROM users WHERE role = ? AND is_active = 1 AND id != ?",
-            (ROLE_ADMIN, exclude_user_id)
-        ).fetchone()
-    conn.close()
+    with Db() as conn:
+        if exclude_user_id is None:
+            row = conn.execute(
+                "SELECT COUNT(*) c FROM users WHERE role = ? AND is_active = 1", (ROLE_ADMIN,)
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT COUNT(*) c FROM users WHERE role = ? AND is_active = 1 AND id != ?",
+                (ROLE_ADMIN, exclude_user_id)
+            ).fetchone()
     return row["c"]
 
 
 def create_user(username, password, role=ROLE_VIEWER):
-    conn = db()
-    cur = conn.execute(
-        "INSERT INTO users (username, password_hash, role, is_active, created_at) "
-        "VALUES (?, ?, ?, 1, ?)",
-        (username, generate_password_hash(password), role, utcnow().isoformat())
-    )
-    conn.commit()
-    new_id = cur.lastrowid
-    conn.close()
+    with Db() as conn:
+        cur = conn.execute(
+            "INSERT INTO users (username, password_hash, role, is_active, created_at) "
+            "VALUES (?, ?, ?, 1, ?)",
+            (username, generate_password_hash(password), role, utcnow().isoformat())
+        )
+        conn.commit()
+        new_id = cur.lastrowid
     return new_id
 
 
 def update_user_password(user_id, password):
-    conn = db()
-    conn.execute("UPDATE users SET password_hash = ? WHERE id = ?",
-                 (generate_password_hash(password), user_id))
-    conn.commit()
-    conn.close()
+    with Db(commit=True) as conn:
+        conn.execute("UPDATE users SET password_hash = ? WHERE id = ?",
+                     (generate_password_hash(password), user_id))
 
 
 # ---------------------------------------------------------------------------
@@ -535,14 +570,12 @@ def log_audit(action, target=None, details=None, username=None, user_id=None, ip
     if ip is None:
         ip = request.remote_addr if request else None
 
-    conn = db()
-    conn.execute(
-        "INSERT INTO audit_log (timestamp, user_id, username, action, target, details, ip_address) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (utcnow().isoformat(), user_id, username, action, target, details, ip)
-    )
-    conn.commit()
-    conn.close()
+    with Db(commit=True) as conn:
+        conn.execute(
+            "INSERT INTO audit_log (timestamp, user_id, username, action, target, details, ip_address) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (utcnow().isoformat(), user_id, username, action, target, details, ip)
+        )
     logger.info(f"AUDIT {username or '-'}@{ip or '-'} {action}"
                 f"{' ' + target if target else ''}{' (' + details + ')' if details else ''}")
 
@@ -560,18 +593,15 @@ def get_audit_log(limit=200, username=None, action=None):
     query += " ORDER BY id DESC LIMIT ?"
     params.append(limit)
 
-    conn = db()
-    rows = conn.execute(query, params).fetchall()
-    conn.close()
+    with Db() as conn:
+        rows = conn.execute(query, params).fetchall()
     return [dict(r) for r in rows]
 
 
 def trim_audit_log():
     cutoff = (utcnow() - timedelta(days=AUDIT_LOG_RETENTION_DAYS)).isoformat()
-    conn = db()
-    conn.execute("DELETE FROM audit_log WHERE timestamp < ?", (cutoff,))
-    conn.commit()
-    conn.close()
+    with Db(commit=True) as conn:
+        conn.execute("DELETE FROM audit_log WHERE timestamp < ?", (cutoff,))
 
 
 # ---------------------------------------------------------------------------
@@ -580,32 +610,27 @@ def trim_audit_log():
 # ---------------------------------------------------------------------------
 def _too_many_attempts(ip):
     cutoff = (utcnow() - timedelta(seconds=LOGIN_WINDOW_SECONDS)).isoformat()
-    conn = db()
-    conn.execute("DELETE FROM login_attempts WHERE timestamp < ?", (cutoff,))
-    conn.commit()
-    row = conn.execute(
-        "SELECT COUNT(*) c FROM login_attempts WHERE ip_address = ? AND timestamp >= ?",
-        (ip, cutoff)
-    ).fetchone()
-    conn.close()
+    with Db() as conn:
+        conn.execute("DELETE FROM login_attempts WHERE timestamp < ?", (cutoff,))
+        conn.commit()
+        row = conn.execute(
+            "SELECT COUNT(*) c FROM login_attempts WHERE ip_address = ? AND timestamp >= ?",
+            (ip, cutoff)
+        ).fetchone()
     return row["c"] >= LOGIN_MAX_ATTEMPTS
 
 
 def _record_failed_attempt(ip, username):
-    conn = db()
-    conn.execute(
-        "INSERT INTO login_attempts (ip_address, username, timestamp) VALUES (?, ?, ?)",
-        (ip, username, utcnow().isoformat())
-    )
-    conn.commit()
-    conn.close()
+    with Db(commit=True) as conn:
+        conn.execute(
+            "INSERT INTO login_attempts (ip_address, username, timestamp) VALUES (?, ?, ?)",
+            (ip, username, utcnow().isoformat())
+        )
 
 
 def _clear_attempts(ip):
-    conn = db()
-    conn.execute("DELETE FROM login_attempts WHERE ip_address = ?", (ip,))
-    conn.commit()
-    conn.close()
+    with Db(commit=True) as conn:
+        conn.execute("DELETE FROM login_attempts WHERE ip_address = ?", (ip,))
 
 
 # ---------------------------------------------------------------------------
@@ -752,6 +777,127 @@ def logout():
 
 # ---------------------------------------------------------------------------
 # Database (SQLite acts as our mini time-series store)
+# Columns added to a table after it first shipped, applied in order on every
+# start. The list *is* the migration: a new column is one row here, and the
+# loop below adds it exactly once. The previous form was one hand-written
+# existence check per column - thirty of them, each running its own PRAGMA.
+SCHEMA_ADDITIONS = (
+    ("metrics", "instance_id", "INTEGER"),
+    ("metrics", "net_rx_bps", "REAL"),
+    ("metrics", "net_tx_bps", "REAL"),
+    ("metrics", "disk_read_bps", "REAL"),
+    ("metrics", "disk_write_bps", "REAL"),
+    ("metrics", "cpu_count", "INTEGER"),
+    ("metrics", "swap_percent", "REAL"),
+    ("metrics", "fs_readonly", "INTEGER"),
+    ("metrics", "net_ifaces_down", "INTEGER"),
+    ("metrics", "boot_time", "REAL"),
+
+    ("instances", "last_status", "TEXT"),
+    ("instances", "last_error", "TEXT"),
+    ("instances", "last_checked_at", "TEXT"),
+    ("instances", "auth_username", "TEXT"),
+    ("instances", "auth_password", "TEXT"),
+    ("instances", "os_type", "TEXT"),
+
+    # Pinning and tagging apply to all three target types alike.
+    ("instances", "pinned_at", "TEXT"),
+    ("instances", "tags", "TEXT"),
+    ("web_targets", "pinned_at", "TEXT"),
+    ("web_targets", "tags", "TEXT"),
+    ("ip_targets", "pinned_at", "TEXT"),
+    ("ip_targets", "tags", "TEXT"),
+
+    # Rows written before website monitoring existed are all VPS alerts, so
+    # the default backfills them correctly.
+    ("alert_subscriptions", "monitor_type", "TEXT NOT NULL DEFAULT 'vps'"),
+
+    ("alert_thresholds", "alert_email", "TEXT"),
+    ("alert_thresholds", "cpu_warn", "REAL"),
+    ("alert_thresholds", "cpu_crit", "REAL"),
+    ("alert_thresholds", "mem_warn", "REAL"),
+    ("alert_thresholds", "mem_crit", "REAL"),
+    ("alert_thresholds", "disk_warn", "REAL"),
+    ("alert_thresholds", "disk_crit", "REAL"),
+    ("alert_thresholds", "net_warn", "REAL"),
+    ("alert_thresholds", "net_crit", "REAL"),
+    ("alert_thresholds", "diskio_warn", "REAL"),
+    ("alert_thresholds", "diskio_crit", "REAL"),
+)
+
+# One index per access pattern, as (name, table, columns). Built after
+# SCHEMA_ADDITIONS because several of these columns arrive by ALTER TABLE on a
+# database written by an early release - indexing a column before it exists
+# fails, which is what the old tables-indexes-migrations order did.
+#
+# Without them a 30-day web_checks table (~1M rows for 21 sites) was
+# full-scanned by the retention trim on every check cycle: the largest
+# constant CPU cost in the app, and the difference between "fine on a laptop"
+# and "unusable on a Raspberry Pi".
+SCHEMA_INDEXES = (
+    # latest-N reads                      time-range reads                    retention trim
+    ("idx_metrics_instance_id", "metrics", "instance_id, id"),
+    ("idx_metrics_instance_ts", "metrics", "instance_id, timestamp"),
+    ("idx_metrics_timestamp", "metrics", "timestamp"),
+
+    ("idx_event_log_timestamp", "event_log", "timestamp"),
+    ("idx_event_log_instance", "event_log", "instance_id"),
+    ("idx_audit_log_timestamp", "audit_log", "timestamp"),
+
+    ("idx_web_checks_target", "web_checks", "target_id, id"),
+    ("idx_web_checks_target_ts", "web_checks", "target_id, timestamp"),
+    ("idx_web_checks_timestamp", "web_checks", "timestamp"),
+
+    ("idx_ip_checks_target", "ip_checks", "target_id, id"),
+    ("idx_ip_checks_target_ts", "ip_checks", "target_id, timestamp"),
+    ("idx_ip_checks_timestamp", "ip_checks", "timestamp"),
+)
+
+# Threshold columns renamed when warn/critical tiers replaced a single max.
+LEGACY_THRESHOLD_COLUMNS = {"cpu_max": "cpu_crit", "mem_max": "mem_crit",
+                            "disk_max": "disk_crit", "net_bps_max": "net_crit"}
+
+
+def _table_columns(conn, table):
+    return {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def _add_missing_columns(conn):
+    """Applies SCHEMA_ADDITIONS. Each table's column list is read once and
+    updated in place, rather than re-queried for every column."""
+    known = {}
+    for table, column, coltype in SCHEMA_ADDITIONS:
+        columns = known.get(table)
+        if columns is None:
+            columns = known[table] = _table_columns(conn, table)
+        if column not in columns:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
+            columns.add(column)
+    conn.commit()
+
+
+def _create_indexes(conn):
+    for name, table, columns in SCHEMA_INDEXES:
+        conn.execute(f"CREATE INDEX IF NOT EXISTS {name} ON {table}({columns})")
+    conn.commit()
+
+
+def _copy_legacy_threshold_values(conn, columns_before):
+    """Carries values over from the single-max threshold columns to the
+    warn/critical pair that replaced them. Takes the column list from *before*
+    the additions ran, because the old names are what it looks for."""
+    stale = [c for c in LEGACY_THRESHOLD_COLUMNS if c in columns_before]
+    if not stale:
+        return
+    for legacy_col in stale:
+        new_col = LEGACY_THRESHOLD_COLUMNS[legacy_col]
+        conn.execute(
+            f"UPDATE alert_thresholds SET {new_col} = {legacy_col} "
+            f"WHERE {new_col} IS NULL AND {legacy_col} IS NOT NULL"
+        )
+    conn.commit()
+
+
 # ---------------------------------------------------------------------------
 def init_db(_attempt=0):
     """Create or upgrade the schema. Safe to call from several processes at
@@ -859,16 +1005,9 @@ def _init_db_once():
     #   latest-N       WHERE key = ? ORDER BY id DESC LIMIT n
     #   time range     WHERE key = ? AND timestamp >= ?
     #   retention trim DELETE WHERE timestamp < ?
-    # One index per access pattern. Without these, a 30-day web_checks table
-    # (~1M rows for 21 sites) was being full-scanned by the trim every single
-    # check cycle - the largest constant CPU cost in the whole app, and the
-    # difference between "fine on a laptop" and "unusable on a Raspberry Pi".
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_metrics_instance_id ON metrics(instance_id, id)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_metrics_instance_ts ON metrics(instance_id, timestamp)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_metrics_timestamp ON metrics(timestamp)")
-
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_event_log_timestamp ON event_log(timestamp)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_event_log_instance ON event_log(instance_id)")
+    # The indexes themselves live in SCHEMA_INDEXES and are built after the
+    # column additions, since several of the columns they cover only exist
+    # once those have run.
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
@@ -894,7 +1033,6 @@ def _init_db_once():
             ip_address TEXT
         )
     """)
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_log_timestamp ON audit_log(timestamp)")
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS login_attempts (
@@ -948,9 +1086,6 @@ def _init_db_once():
             error TEXT
         )
     """)
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_web_checks_target ON web_checks(target_id, id)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_web_checks_target_ts ON web_checks(target_id, timestamp)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_web_checks_timestamp ON web_checks(timestamp)")
 
     # --- IP / host monitoring ----------------------------------------------
     conn.execute("""
@@ -983,9 +1118,6 @@ def _init_db_once():
             error TEXT
         )
     """)
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_ip_checks_target ON ip_checks(target_id, id)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_ip_checks_target_ts ON ip_checks(target_id, timestamp)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_ip_checks_timestamp ON ip_checks(timestamp)")
     conn.commit()
 
     # INSERT OR IGNORE rather than check-then-insert: two services starting
@@ -994,76 +1126,12 @@ def _init_db_once():
                  (secrets.token_hex(8),))
     conn.commit()
 
-    # --- migrate a pre-multi-instance / pre-severity-tier metrics.db in place ---
-    cols = [r[1] for r in conn.execute("PRAGMA table_info(metrics)").fetchall()]
-    if "instance_id" not in cols:
-        conn.execute("ALTER TABLE metrics ADD COLUMN instance_id INTEGER")
-    if "net_rx_bps" not in cols:
-        conn.execute("ALTER TABLE metrics ADD COLUMN net_rx_bps REAL")
-    if "net_tx_bps" not in cols:
-        conn.execute("ALTER TABLE metrics ADD COLUMN net_tx_bps REAL")
-    if "disk_read_bps" not in cols:
-        conn.execute("ALTER TABLE metrics ADD COLUMN disk_read_bps REAL")
-    if "disk_write_bps" not in cols:
-        conn.execute("ALTER TABLE metrics ADD COLUMN disk_write_bps REAL")
-    if "cpu_count" not in cols:
-        conn.execute("ALTER TABLE metrics ADD COLUMN cpu_count INTEGER")
-    if "swap_percent" not in cols:
-        conn.execute("ALTER TABLE metrics ADD COLUMN swap_percent REAL")
-    if "fs_readonly" not in cols:
-        conn.execute("ALTER TABLE metrics ADD COLUMN fs_readonly INTEGER")
-    if "net_ifaces_down" not in cols:
-        conn.execute("ALTER TABLE metrics ADD COLUMN net_ifaces_down INTEGER")
-    if "boot_time" not in cols:
-        conn.execute("ALTER TABLE metrics ADD COLUMN boot_time REAL")
-
-    inst_cols = [r[1] for r in conn.execute("PRAGMA table_info(instances)").fetchall()]
-    if "last_status" not in inst_cols:
-        conn.execute("ALTER TABLE instances ADD COLUMN last_status TEXT")
-    if "last_error" not in inst_cols:
-        conn.execute("ALTER TABLE instances ADD COLUMN last_error TEXT")
-    if "last_checked_at" not in inst_cols:
-        conn.execute("ALTER TABLE instances ADD COLUMN last_checked_at TEXT")
-    if "auth_username" not in inst_cols:
-        conn.execute("ALTER TABLE instances ADD COLUMN auth_username TEXT")
-    if "auth_password" not in inst_cols:
-        conn.execute("ALTER TABLE instances ADD COLUMN auth_password TEXT")
-    if "os_type" not in inst_cols:
-        conn.execute("ALTER TABLE instances ADD COLUMN os_type TEXT")
-
-    # Pinning and tagging arrived after the first releases, so every one of
-    # the three target tables needs the same pair added in place.
-    for table in ("instances", "web_targets", "ip_targets"):
-        cols = [r[1] for r in conn.execute("PRAGMA table_info(%s)" % table).fetchall()]
-        if "pinned_at" not in cols:
-            conn.execute("ALTER TABLE %s ADD COLUMN pinned_at TEXT" % table)
-        if "tags" not in cols:
-            conn.execute("ALTER TABLE %s ADD COLUMN tags TEXT" % table)
-
-    sub_cols = [r[1] for r in conn.execute("PRAGMA table_info(alert_subscriptions)").fetchall()]
-    if "monitor_type" not in sub_cols:
-        # Existing rows all predate website monitoring, so they are VPS alerts.
-        conn.execute("ALTER TABLE alert_subscriptions ADD COLUMN monitor_type TEXT NOT NULL DEFAULT 'vps'")
-        conn.commit()
-
-    thresh_cols = [r[1] for r in conn.execute("PRAGMA table_info(alert_thresholds)").fetchall()]
-    legacy_map = {"cpu_max": "cpu_crit", "mem_max": "mem_crit",
-                  "disk_max": "disk_crit", "net_bps_max": "net_crit"}
-    for new_col in ("alert_email TEXT", "cpu_warn REAL", "cpu_crit REAL", "mem_warn REAL",
-                     "mem_crit REAL", "disk_warn REAL", "disk_crit REAL", "net_warn REAL",
-                     "net_crit REAL", "diskio_warn REAL", "diskio_crit REAL"):
-        col_name = new_col.split()[0]
-        if col_name not in thresh_cols:
-            conn.execute(f"ALTER TABLE alert_thresholds ADD COLUMN {new_col}")
-    conn.commit()
-    if any(legacy in thresh_cols for legacy in legacy_map):
-        for legacy_col, new_col in legacy_map.items():
-            if legacy_col in thresh_cols:
-                conn.execute(
-                    f"UPDATE alert_thresholds SET {new_col} = {legacy_col} "
-                    f"WHERE {new_col} IS NULL AND {legacy_col} IS NOT NULL"
-                )
-        conn.commit()
+    # Columns that arrived after their table shipped. Adding one is a row in
+    # SCHEMA_ADDITIONS, not another hand-written existence check.
+    thresholds_before = _table_columns(conn, "alert_thresholds")
+    _add_missing_columns(conn)
+    _create_indexes(conn)
+    _copy_legacy_threshold_values(conn, thresholds_before)
 
     # --- one-time migration: the old single alert_email-per-instance model
     # becomes explicit (instance, email, alert_type) subscription rows, one
@@ -1109,9 +1177,8 @@ def bootstrap_admin_user():
     """Create the first admin account if the users table is empty. Uses
     APP_USERNAME/APP_PASSWORD when provided (so existing setups keep their
     credentials), otherwise generates a password and prints it once."""
-    conn = db()
-    existing = conn.execute("SELECT COUNT(*) c FROM users").fetchone()["c"]
-    conn.close()
+    with Db() as conn:
+        existing = conn.execute("SELECT COUNT(*) c FROM users").fetchone()["c"]
     if existing:
         return None
 
@@ -1152,46 +1219,43 @@ def get_instances(include_secrets=False):
     scrape loop's own use. Every API-facing caller gets include_secrets=False
     (the default), so the password never round-trips into a browser response;
     `has_auth` tells the UI whether one is set without revealing it."""
-    conn = db()
-    rows = conn.execute("SELECT * FROM instances " + PINNED_ORDER).fetchall()
-    instances = [dict(r) for r in rows]
-    for inst in instances:
-        decorate_pin_tags(inst)
-        inst["has_auth"] = bool(inst.get("auth_username"))
-        # Callers that asked for secrets get the usable password, not the
-        # stored ciphertext - the scraper should not know encryption exists.
-        if include_secrets and inst.get("auth_password"):
-            inst["auth_password"] = decrypt_secret(inst["auth_password"])
-        inst["os_label"] = OS_LABELS.get(inst.get("os_type"))
-        if not include_secrets:
-            inst.pop("auth_password", None)
-        latest = get_latest(inst["id"], conn=conn)
-        thresholds = get_thresholds(inst["id"], conn=conn)
-        inst["severity"] = evaluate_severity(latest, thresholds)
-        inst["health"] = evaluate_health(
-            inst, get_history_for_health(inst["id"], conn=conn))
-    conn.close()
+    with Db() as conn:
+        rows = conn.execute("SELECT * FROM instances " + PINNED_ORDER).fetchall()
+        instances = [dict(r) for r in rows]
+        for inst in instances:
+            decorate_pin_tags(inst)
+            inst["has_auth"] = bool(inst.get("auth_username"))
+            # Callers that asked for secrets get the usable password, not the
+            # stored ciphertext - the scraper should not know encryption exists.
+            if include_secrets and inst.get("auth_password"):
+                inst["auth_password"] = decrypt_secret(inst["auth_password"])
+            inst["os_label"] = OS_LABELS.get(inst.get("os_type"))
+            if not include_secrets:
+                inst.pop("auth_password", None)
+            latest = get_latest(inst["id"], conn=conn)
+            thresholds = get_thresholds(inst["id"], conn=conn)
+            inst["severity"] = evaluate_severity(latest, thresholds)
+            inst["health"] = evaluate_health(
+                inst, get_history_for_health(inst["id"], conn=conn))
     return instances
 
 
 def save_metrics(instance_id, m):
-    conn = db()
-    conn.execute("""
-        INSERT INTO metrics
-        (instance_id, timestamp, cpu_percent, mem_percent, mem_used_mb, mem_total_mb,
-         disk_percent, disk_used_gb, disk_total_gb, net_rx_bytes, net_tx_bytes,
-         net_rx_bps, net_tx_bps, disk_read_bps, disk_write_bps, load1,
-         cpu_count, swap_percent, fs_readonly, net_ifaces_down, boot_time)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        instance_id, m["timestamp"], m["cpu_percent"], m["mem_percent"], m["mem_used_mb"],
-        m["mem_total_mb"], m["disk_percent"], m["disk_used_gb"], m["disk_total_gb"],
-        m["net_rx_bytes"], m["net_tx_bytes"], m["net_rx_bps"], m["net_tx_bps"],
-        m["disk_read_bps"], m["disk_write_bps"], m["load1"],
-        m["cpu_count"], m["swap_percent"], m["fs_readonly"], m["net_ifaces_down"], m["boot_time"]
-    ))
-    conn.commit()
-    conn.close()
+    with Db(commit=True) as conn:
+        conn.execute("""
+            INSERT INTO metrics
+            (instance_id, timestamp, cpu_percent, mem_percent, mem_used_mb, mem_total_mb,
+             disk_percent, disk_used_gb, disk_total_gb, net_rx_bytes, net_tx_bytes,
+             net_rx_bps, net_tx_bps, disk_read_bps, disk_write_bps, load1,
+             cpu_count, swap_percent, fs_readonly, net_ifaces_down, boot_time)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            instance_id, m["timestamp"], m["cpu_percent"], m["mem_percent"], m["mem_used_mb"],
+            m["mem_total_mb"], m["disk_percent"], m["disk_used_gb"], m["disk_total_gb"],
+            m["net_rx_bytes"], m["net_tx_bytes"], m["net_rx_bps"], m["net_tx_bps"],
+            m["disk_read_bps"], m["disk_write_bps"], m["load1"],
+            m["cpu_count"], m["swap_percent"], m["fs_readonly"], m["net_ifaces_down"], m["boot_time"]
+        ))
 
 
 def get_latest(instance_id, conn=None):
@@ -1209,11 +1273,10 @@ def get_latest(instance_id, conn=None):
 
 
 def get_history(instance_id, limit=60):
-    conn = db()
-    rows = conn.execute(
-        "SELECT * FROM metrics WHERE instance_id = ? ORDER BY id DESC LIMIT ?", (instance_id, limit)
-    ).fetchall()
-    conn.close()
+    with Db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM metrics WHERE instance_id = ? ORDER BY id DESC LIMIT ?", (instance_id, limit)
+        ).fetchall()
     return [dict(r) for r in reversed(rows)]
 
 
@@ -1285,10 +1348,8 @@ def get_history_for_health(instance_id, limit=30, conn=None):
 
 def trim_metrics():
     cutoff = (utcnow() - timedelta(days=METRICS_RETENTION_DAYS)).isoformat()
-    conn = db()
-    conn.execute("DELETE FROM metrics WHERE timestamp < ?", (cutoff,))
-    conn.commit()
-    conn.close()
+    with Db(commit=True) as conn:
+        conn.execute("DELETE FROM metrics WHERE timestamp < ?", (cutoff,))
 
 
 def get_thresholds(instance_id, conn=None):
@@ -1313,50 +1374,43 @@ def alert_label_for(alert_type):
             or IP_ALERT_TYPE_LABELS.get(alert_type) or alert_type)
 
 
-def get_subscriptions(instance_id):
-    """VPS subscriptions for one instance."""
-    conn = db()
-    rows = conn.execute(
-        "SELECT * FROM alert_subscriptions WHERE instance_id = ? AND monitor_type = 'vps' ORDER BY id",
-        (instance_id,)
-    ).fetchall()
-    conn.close()
+def get_subscriptions_for(monitor_type, target_id):
+    """Alert subscriptions of one monitor type for one target. The three
+    types differ by nothing but that string, so they share this."""
+    with Db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM alert_subscriptions WHERE instance_id = ? "
+            "AND monitor_type = ? ORDER BY id", (target_id, monitor_type)).fetchall()
     subs = [dict(r) for r in rows]
     for s in subs:
         s["alert_type_label"] = alert_label_for(s["alert_type"])
     return subs
+
+
+def get_subscriptions(instance_id):
+    return get_subscriptions_for("vps", instance_id)
 
 
 def get_subscriptions_for_web(target_id):
-    conn = db()
-    rows = conn.execute(
-        "SELECT * FROM alert_subscriptions WHERE instance_id = ? AND monitor_type = 'web' ORDER BY id",
-        (target_id,)
-    ).fetchall()
-    conn.close()
-    subs = [dict(r) for r in rows]
-    for s in subs:
-        s["alert_type_label"] = alert_label_for(s["alert_type"])
-    return subs
+    return get_subscriptions_for("web", target_id)
 
 
 def get_all_subscriptions():
     """Every subscription of every monitor type, with the target's name resolved.
     A LEFT JOIN against each table so a row is never dropped just because it
     points at the other kind of monitor."""
-    conn = db()
-    rows = conn.execute("""
-        SELECT s.*,
-               i.name AS vps_name, i.target_url AS vps_url,
-               w.name AS web_name, w.url AS web_url,
-               p.name AS ip_name, p.address AS ip_addr
-        FROM alert_subscriptions s
-        LEFT JOIN instances   i ON i.id = s.instance_id AND s.monitor_type = 'vps'
-        LEFT JOIN web_targets w ON w.id = s.instance_id AND s.monitor_type = 'web'
-        LEFT JOIN ip_targets  p ON p.id = s.instance_id AND s.monitor_type = 'ip'
-        ORDER BY s.id
-    """).fetchall()
-    conn.close()
+    with Db() as conn:
+        rows = conn.execute("""
+            SELECT s.*,
+                   i.name AS vps_name, i.target_url AS vps_url,
+                   w.name AS web_name, w.url AS web_url,
+                   p.name AS ip_name, p.address AS ip_addr
+            FROM alert_subscriptions s
+            LEFT JOIN instances   i ON i.id = s.instance_id AND s.monitor_type = 'vps'
+            LEFT JOIN web_targets w ON w.id = s.instance_id AND s.monitor_type = 'web'
+            LEFT JOIN ip_targets  p ON p.id = s.instance_id AND s.monitor_type = 'ip'
+            ORDER BY s.id
+        """).fetchall()
     subs = []
     for r in rows:
         s = dict(r)
@@ -1385,14 +1439,12 @@ def emails_for_alert_type(subscriptions, alert_type):
 # vps_monitor.log even though only the noteworthy stuff is stored here.
 # ---------------------------------------------------------------------------
 def log_event(level, category, message, instance_id=None, instance_name=None):
-    conn = db()
-    conn.execute(
-        "INSERT INTO event_log (timestamp, instance_id, instance_name, level, category, message) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (utcnow().isoformat(), instance_id, instance_name, level, category, message)
-    )
-    conn.commit()
-    conn.close()
+    with Db(commit=True) as conn:
+        conn.execute(
+            "INSERT INTO event_log (timestamp, instance_id, instance_name, level, category, message) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (utcnow().isoformat(), instance_id, instance_name, level, category, message)
+        )
 
     prefix = f"[{instance_name}] " if instance_name else ""
     {"info": logger.info, "warn": logger.warning, "error": logger.error}[level](f"{prefix}{message}")
@@ -1400,27 +1452,24 @@ def log_event(level, category, message, instance_id=None, instance_name=None):
 
 def trim_event_log():
     cutoff = (utcnow() - timedelta(days=EVENT_LOG_RETENTION_DAYS)).isoformat()
-    conn = db()
-    conn.execute("DELETE FROM event_log WHERE timestamp < ?", (cutoff,))
-    conn.commit()
-    conn.close()
+    with Db(commit=True) as conn:
+        conn.execute("DELETE FROM event_log WHERE timestamp < ?", (cutoff,))
 
 
 def get_logs(instance_id=None, level=None, limit=200):
     limit = max(1, min(limit, 500))
-    conn = db()
-    query = "SELECT * FROM event_log WHERE 1=1"
-    params = []
-    if instance_id is not None:
-        query += " AND instance_id = ?"
-        params.append(instance_id)
-    if level:
-        query += " AND level = ?"
-        params.append(level)
-    query += " ORDER BY id DESC LIMIT ?"
-    params.append(limit)
-    rows = conn.execute(query, params).fetchall()
-    conn.close()
+    with Db() as conn:
+        query = "SELECT * FROM event_log WHERE 1=1"
+        params = []
+        if instance_id is not None:
+            query += " AND instance_id = ?"
+            params.append(instance_id)
+        if level:
+            query += " AND level = ?"
+            params.append(level)
+        query += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+        rows = conn.execute(query, params).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -1750,20 +1799,16 @@ def set_instance_os_type(instance_id, os_type):
     """Recorded on the instance so the dashboard can label it without
     re-scraping. Written only when it changes - normally once, on the first
     successful scrape after an instance is added."""
-    conn = db()
-    conn.execute("UPDATE instances SET os_type = ? WHERE id = ?", (os_type, instance_id))
-    conn.commit()
-    conn.close()
+    with Db(commit=True) as conn:
+        conn.execute("UPDATE instances SET os_type = ? WHERE id = ?", (os_type, instance_id))
 
 
 def set_instance_status(instance_id, status, error=None):
-    conn = db()
-    conn.execute(
-        "UPDATE instances SET last_status = ?, last_error = ?, last_checked_at = ? WHERE id = ?",
-        (status, error, utcnow().isoformat(), instance_id)
-    )
-    conn.commit()
-    conn.close()
+    with Db(commit=True) as conn:
+        conn.execute(
+            "UPDATE instances SET last_status = ?, last_error = ?, last_checked_at = ? WHERE id = ?",
+            (status, error, utcnow().isoformat(), instance_id)
+        )
 
 
 def normalize_target_url(url):
@@ -1992,9 +2037,8 @@ def maybe_alert(inst, metrics, thresholds, subscriptions):
 # observed from outside, the same way an ordinary visitor sees the site.
 # ---------------------------------------------------------------------------
 def get_web_targets():
-    conn = db()
-    rows = conn.execute("SELECT * FROM web_targets " + PINNED_ORDER).fetchall()
-    conn.close()
+    with Db() as conn:
+        rows = conn.execute("SELECT * FROM web_targets " + PINNED_ORDER).fetchall()
     targets = [dict(r) for r in rows]
     for t in targets:
         decorate_pin_tags(t)
@@ -2004,36 +2048,33 @@ def get_web_targets():
 
 
 def get_web_target(target_id):
-    conn = db()
-    row = conn.execute("SELECT * FROM web_targets WHERE id = ?", (target_id,)).fetchone()
-    conn.close()
+    with Db() as conn:
+        row = conn.execute("SELECT * FROM web_targets WHERE id = ?", (target_id,)).fetchone()
     return dict(row) if row else None
 
 
 def get_web_latest(target_id):
-    conn = db()
-    row = conn.execute(
-        "SELECT * FROM web_checks WHERE target_id = ? ORDER BY id DESC LIMIT 1", (target_id,)
-    ).fetchone()
-    conn.close()
+    with Db() as conn:
+        row = conn.execute(
+            "SELECT * FROM web_checks WHERE target_id = ? ORDER BY id DESC LIMIT 1", (target_id,)
+        ).fetchone()
     return dict(row) if row else None
 
 
 def get_web_history(target_id, seconds=None, limit=200):
-    conn = db()
-    if seconds:
-        cutoff = (utcnow() - timedelta(seconds=seconds)).isoformat()
-        rows = conn.execute(
-            "SELECT * FROM web_checks WHERE target_id = ? AND timestamp >= ? ORDER BY id ASC",
-            (target_id, cutoff)
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT * FROM web_checks WHERE target_id = ? ORDER BY id DESC LIMIT ?",
-            (target_id, limit)
-        ).fetchall()
-        rows = list(reversed(rows))
-    conn.close()
+    with Db() as conn:
+        if seconds:
+            cutoff = (utcnow() - timedelta(seconds=seconds)).isoformat()
+            rows = conn.execute(
+                "SELECT * FROM web_checks WHERE target_id = ? AND timestamp >= ? ORDER BY id ASC",
+                (target_id, cutoff)
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM web_checks WHERE target_id = ? ORDER BY id DESC LIMIT ?",
+                (target_id, limit)
+            ).fetchall()
+            rows = list(reversed(rows))
     return [dict(r) for r in rows]
 
 
@@ -2129,15 +2170,13 @@ def check_web_target(target):
 
 
 def save_web_check(result):
-    conn = db()
-    conn.execute("""
-        INSERT INTO web_checks (target_id, timestamp, ok, status_code, response_ms,
-                                resolved_ip, cert_days, cert_valid, keyword_ok, final_url, error)
-        VALUES (:target_id, :timestamp, :ok, :status_code, :response_ms,
-                :resolved_ip, :cert_days, :cert_valid, :keyword_ok, :final_url, :error)
-    """, result)
-    conn.commit()
-    conn.close()
+    with Db(commit=True) as conn:
+        conn.execute("""
+            INSERT INTO web_checks (target_id, timestamp, ok, status_code, response_ms,
+                                    resolved_ip, cert_days, cert_valid, keyword_ok, final_url, error)
+            VALUES (:target_id, :timestamp, :ok, :status_code, :response_ms,
+                    :resolved_ip, :cert_days, :cert_valid, :keyword_ok, :final_url, :error)
+        """, result)
 
 
 def evaluate_web_health(target, latest):
@@ -2290,18 +2329,15 @@ def get_web_stats(target_id, seconds):
     already stored, so no extra polling is involved. Latency figures only
     count checks that actually got a response."""
     cutoff = (utcnow() - timedelta(seconds=seconds)).isoformat()
-    conn = db()
-    stats = _series_stats(conn, "web_checks", "response_ms", target_id, cutoff)
-    conn.close()
+    with Db() as conn:
+        stats = _series_stats(conn, "web_checks", "response_ms", target_id, cutoff)
     return stats
 
 
 def trim_web_checks():
     cutoff = (utcnow() - timedelta(days=WEB_CHECK_RETENTION_DAYS)).isoformat()
-    conn = db()
-    conn.execute("DELETE FROM web_checks WHERE timestamp < ?", (cutoff,))
-    conn.commit()
-    conn.close()
+    with Db(commit=True) as conn:
+        conn.execute("DELETE FROM web_checks WHERE timestamp < ?", (cutoff,))
 
 
 _web_trim_counter = [0]
@@ -2355,9 +2391,8 @@ def web_check_loop():
 #          and plenty of hosts (and most cloud firewalls) drop ICMP entirely.
 # ---------------------------------------------------------------------------
 def get_ip_targets():
-    conn = db()
-    rows = conn.execute("SELECT * FROM ip_targets " + PINNED_ORDER).fetchall()
-    conn.close()
+    with Db() as conn:
+        rows = conn.execute("SELECT * FROM ip_targets " + PINNED_ORDER).fetchall()
     targets = [dict(r) for r in rows]
     for t in targets:
         decorate_pin_tags(t)
@@ -2367,43 +2402,39 @@ def get_ip_targets():
 
 
 def get_ip_target(target_id):
-    conn = db()
-    row = conn.execute("SELECT * FROM ip_targets WHERE id = ?", (target_id,)).fetchone()
-    conn.close()
+    with Db() as conn:
+        row = conn.execute("SELECT * FROM ip_targets WHERE id = ?", (target_id,)).fetchone()
     return dict(row) if row else None
 
 
 def get_ip_latest(target_id):
-    conn = db()
-    row = conn.execute(
-        "SELECT * FROM ip_checks WHERE target_id = ? ORDER BY id DESC LIMIT 1", (target_id,)
-    ).fetchone()
-    conn.close()
+    with Db() as conn:
+        row = conn.execute(
+            "SELECT * FROM ip_checks WHERE target_id = ? ORDER BY id DESC LIMIT 1", (target_id,)
+        ).fetchone()
     return dict(row) if row else None
 
 
 def get_ip_history(target_id, seconds=None, limit=200):
-    conn = db()
-    if seconds:
-        cutoff = (utcnow() - timedelta(seconds=seconds)).isoformat()
-        rows = conn.execute(
-            "SELECT * FROM ip_checks WHERE target_id = ? AND timestamp >= ? ORDER BY id ASC",
-            (target_id, cutoff)
-        ).fetchall()
-    else:
-        rows = list(reversed(conn.execute(
-            "SELECT * FROM ip_checks WHERE target_id = ? ORDER BY id DESC LIMIT ?",
-            (target_id, limit)
-        ).fetchall()))
-    conn.close()
+    with Db() as conn:
+        if seconds:
+            cutoff = (utcnow() - timedelta(seconds=seconds)).isoformat()
+            rows = conn.execute(
+                "SELECT * FROM ip_checks WHERE target_id = ? AND timestamp >= ? ORDER BY id ASC",
+                (target_id, cutoff)
+            ).fetchall()
+        else:
+            rows = list(reversed(conn.execute(
+                "SELECT * FROM ip_checks WHERE target_id = ? ORDER BY id DESC LIMIT ?",
+                (target_id, limit)
+            ).fetchall()))
     return [dict(r) for r in rows]
 
 
 def get_ip_stats(target_id, seconds):
     cutoff = (utcnow() - timedelta(seconds=seconds)).isoformat()
-    conn = db()
-    stats = _series_stats(conn, "ip_checks", "latency_ms", target_id, cutoff)
-    conn.close()
+    with Db() as conn:
+        stats = _series_stats(conn, "ip_checks", "latency_ms", target_id, cutoff)
     return stats
 
 
@@ -2475,13 +2506,11 @@ def check_ip_target(target):
 
 
 def save_ip_check(result):
-    conn = db()
-    conn.execute("""
-        INSERT INTO ip_checks (target_id, timestamp, ok, latency_ms, resolved_ip, port_open, error)
-        VALUES (:target_id, :timestamp, :ok, :latency_ms, :resolved_ip, :port_open, :error)
-    """, result)
-    conn.commit()
-    conn.close()
+    with Db(commit=True) as conn:
+        conn.execute("""
+            INSERT INTO ip_checks (target_id, timestamp, ok, latency_ms, resolved_ip, port_open, error)
+            VALUES (:target_id, :timestamp, :ok, :latency_ms, :resolved_ip, :port_open, :error)
+        """, result)
 
 
 def evaluate_ip_health(target, latest):
@@ -2520,16 +2549,7 @@ IP_CHECK_ALERT = {
 
 
 def get_subscriptions_for_ip(target_id):
-    conn = db()
-    rows = conn.execute(
-        "SELECT * FROM alert_subscriptions WHERE instance_id = ? AND monitor_type = 'ip' ORDER BY id",
-        (target_id,)
-    ).fetchall()
-    conn.close()
-    subs = [dict(r) for r in rows]
-    for s in subs:
-        s["alert_type_label"] = alert_label_for(s["alert_type"])
-    return subs
+    return get_subscriptions_for("ip", target_id)
 
 
 def maybe_alert_ip(target, health, subscriptions, latest):
@@ -2567,10 +2587,8 @@ def maybe_alert_ip(target, health, subscriptions, latest):
 
 def trim_ip_checks():
     cutoff = (utcnow() - timedelta(days=IP_CHECK_RETENTION_DAYS)).isoformat()
-    conn = db()
-    conn.execute("DELETE FROM ip_checks WHERE timestamp < ?", (cutoff,))
-    conn.commit()
-    conn.close()
+    with Db(commit=True) as conn:
+        conn.execute("DELETE FROM ip_checks WHERE timestamp < ?", (cutoff,))
 
 
 _ip_trim_counter = [0]
@@ -2829,13 +2847,11 @@ def api_instances_update(instance_id):
 @app.route("/api/instances/<int:instance_id>", methods=["DELETE"])
 def api_instances_delete(instance_id):
     doomed = next((i for i in get_instances() if i["id"] == instance_id), None)
-    conn = db()
-    conn.execute("DELETE FROM instances WHERE id = ?", (instance_id,))
-    conn.execute("DELETE FROM metrics WHERE instance_id = ?", (instance_id,))
-    conn.execute("DELETE FROM alert_thresholds WHERE instance_id = ?", (instance_id,))
-    conn.execute("DELETE FROM alert_subscriptions WHERE instance_id = ?", (instance_id,))
-    conn.commit()
-    conn.close()
+    with Db(commit=True) as conn:
+        conn.execute("DELETE FROM instances WHERE id = ?", (instance_id,))
+        conn.execute("DELETE FROM metrics WHERE instance_id = ?", (instance_id,))
+        conn.execute("DELETE FROM alert_thresholds WHERE instance_id = ?", (instance_id,))
+        conn.execute("DELETE FROM alert_subscriptions WHERE instance_id = ?", (instance_id,))
     _prev_state.pop(instance_id, None)
     _prev_severity.pop(instance_id, None)
     _prev_health.pop(instance_id, None)
@@ -2931,12 +2947,11 @@ def api_forecast_disk():
         return jsonify(_disk_forecast_cache["data"])
 
     out = []
-    conn = db()
-    for inst in conn.execute("SELECT id, name FROM instances").fetchall():
-        f = forecast_disk_full(conn, inst["id"], now)
-        if f:
-            out.append(dict(f, instance_id=inst["id"], name=inst["name"]))
-    conn.close()
+    with Db() as conn:
+        for inst in conn.execute("SELECT id, name FROM instances").fetchall():
+            f = forecast_disk_full(conn, inst["id"], now)
+            if f:
+                out.append(dict(f, instance_id=inst["id"], name=inst["name"]))
     # Soonest to fill first; everything without a date sorts after.
     out.sort(key=lambda e: e["days"] if e["days"] is not None else float("inf"))
     _disk_forecast_cache.update(at=now, data=out)
@@ -2992,15 +3007,14 @@ def api_tags_list():
     """Every tag in use, with how many targets carry it - the dashboard's
     filter dropdown is built from this."""
     counts = {}
-    conn = db()
-    for monitor_type, (table, _) in MONITOR_TABLES.items():
-        for row in conn.execute("SELECT tags FROM %s WHERE tags IS NOT NULL" % table):
-            for tag in tag_list(row["tags"]):
-                entry = counts.setdefault(tag, {"tag": tag, "total": 0,
-                                                "vps": 0, "web": 0, "ip": 0})
-                entry["total"] += 1
-                entry[monitor_type] += 1
-    conn.close()
+    with Db() as conn:
+        for monitor_type, (table, _) in MONITOR_TABLES.items():
+            for row in conn.execute("SELECT tags FROM %s WHERE tags IS NOT NULL" % table):
+                for tag in tag_list(row["tags"]):
+                    entry = counts.setdefault(tag, {"tag": tag, "total": 0,
+                                                    "vps": 0, "web": 0, "ip": 0})
+                    entry["total"] += 1
+                    entry[monitor_type] += 1
     return jsonify(sorted(counts.values(), key=lambda e: (-e["total"], e["tag"].lower())))
 
 
@@ -3029,25 +3043,23 @@ def _tag_bulk_update(op, tag, new_tag=None):
     duplicates, so "company a" and "Company A" are one tag here too."""
     want = tag.strip().lower()
     changed = 0
-    conn = db()
-    for table, _ in MONITOR_TABLES.values():
-        rows = conn.execute(
-            "SELECT id, tags FROM %s WHERE tags IS NOT NULL" % table).fetchall()
-        for row in rows:
-            current = tag_list(row["tags"])
-            if not any(t.lower() == want for t in current):
-                continue
-            if op == "rename":
-                updated = [new_tag if t.lower() == want else t for t in current]
-            else:
-                updated = [t for t in current if t.lower() != want]
-            # Back through normalize_tags so a rename onto an existing tag
-            # merges instead of leaving the target with it listed twice.
-            conn.execute("UPDATE %s SET tags = ? WHERE id = ?" % table,
-                         (normalize_tags(updated), row["id"]))
-            changed += 1
-    conn.commit()
-    conn.close()
+    with Db(commit=True) as conn:
+        for table, _ in MONITOR_TABLES.values():
+            rows = conn.execute(
+                "SELECT id, tags FROM %s WHERE tags IS NOT NULL" % table).fetchall()
+            for row in rows:
+                current = tag_list(row["tags"])
+                if not any(t.lower() == want for t in current):
+                    continue
+                if op == "rename":
+                    updated = [new_tag if t.lower() == want else t for t in current]
+                else:
+                    updated = [t for t in current if t.lower() != want]
+                # Back through normalize_tags so a rename onto an existing tag
+                # merges instead of leaving the target with it listed twice.
+                conn.execute("UPDATE %s SET tags = ? WHERE id = ?" % table,
+                             (normalize_tags(updated), row["id"]))
+                changed += 1
     return changed
 
 
@@ -3058,15 +3070,14 @@ def api_tags_targets():
     if not want:
         return jsonify({"error": "tag is required"}), 400
     out = []
-    conn = db()
-    for monitor_type, (table, _) in MONITOR_TABLES.items():
-        for row in conn.execute(
-                "SELECT id, name, tags FROM %s WHERE tags IS NOT NULL " % table
-                + PINNED_ORDER):
-            if any(t.lower() == want for t in tag_list(row["tags"])):
-                out.append({"monitor_type": monitor_type,
-                            "id": row["id"], "name": row["name"]})
-    conn.close()
+    with Db() as conn:
+        for monitor_type, (table, _) in MONITOR_TABLES.items():
+            for row in conn.execute(
+                    "SELECT id, name, tags FROM %s WHERE tags IS NOT NULL " % table
+                    + PINNED_ORDER):
+                if any(t.lower() == want for t in tag_list(row["tags"])):
+                    out.append({"monitor_type": monitor_type,
+                                "id": row["id"], "name": row["name"]})
     return jsonify(out)
 
 
@@ -3113,10 +3124,9 @@ def api_latest_all():
     """Latest sample for every instance in one round trip - the overview grid
     was issuing one request per instance per poll, which on a small server
     means N gunicorn wakeups every 10 seconds for data one query can carry."""
-    conn = db()
-    ids = [r["id"] for r in conn.execute("SELECT id FROM instances").fetchall()]
-    out = {str(iid): get_latest(iid, conn=conn) for iid in ids}
-    conn.close()
+    with Db() as conn:
+        ids = [r["id"] for r in conn.execute("SELECT id FROM instances").fetchall()]
+        out = {str(iid): get_latest(iid, conn=conn) for iid in ids}
     return jsonify(out)
 
 
@@ -3160,22 +3170,20 @@ def api_thresholds_set():
         values[f"{key}_warn"] = clean(data.get(f"{key}_warn"))
         values[f"{key}_crit"] = clean(data.get(f"{key}_crit"))
 
-    conn = db()
-    conn.execute("""
-        INSERT INTO alert_thresholds
-            (instance_id, cpu_warn, cpu_crit, mem_warn, mem_crit,
-             disk_warn, disk_crit, net_warn, net_crit, diskio_warn, diskio_crit)
-        VALUES (:instance_id, :cpu_warn, :cpu_crit, :mem_warn, :mem_crit,
-                :disk_warn, :disk_crit, :net_warn, :net_crit, :diskio_warn, :diskio_crit)
-        ON CONFLICT(instance_id) DO UPDATE SET
-            cpu_warn = excluded.cpu_warn, cpu_crit = excluded.cpu_crit,
-            mem_warn = excluded.mem_warn, mem_crit = excluded.mem_crit,
-            disk_warn = excluded.disk_warn, disk_crit = excluded.disk_crit,
-            net_warn = excluded.net_warn, net_crit = excluded.net_crit,
-            diskio_warn = excluded.diskio_warn, diskio_crit = excluded.diskio_crit
-    """, values)
-    conn.commit()
-    conn.close()
+    with Db(commit=True) as conn:
+        conn.execute("""
+            INSERT INTO alert_thresholds
+                (instance_id, cpu_warn, cpu_crit, mem_warn, mem_crit,
+                 disk_warn, disk_crit, net_warn, net_crit, diskio_warn, diskio_crit)
+            VALUES (:instance_id, :cpu_warn, :cpu_crit, :mem_warn, :mem_crit,
+                    :disk_warn, :disk_crit, :net_warn, :net_crit, :diskio_warn, :diskio_crit)
+            ON CONFLICT(instance_id) DO UPDATE SET
+                cpu_warn = excluded.cpu_warn, cpu_crit = excluded.cpu_crit,
+                mem_warn = excluded.mem_warn, mem_crit = excluded.mem_crit,
+                disk_warn = excluded.disk_warn, disk_crit = excluded.disk_crit,
+                net_warn = excluded.net_warn, net_crit = excluded.net_crit,
+                diskio_warn = excluded.diskio_warn, diskio_crit = excluded.diskio_crit
+        """, values)
 
     inst = next((i for i in get_instances() if i["id"] == instance_id), None)
     summary = ", ".join(
@@ -3218,20 +3226,15 @@ def api_web_targets_create():
     if not urlsplit(url).hostname:
         return jsonify({"error": "that does not look like a valid URL"}), 400
 
-    def opt_int(key):
-        v = data.get(key)
-        try:
-            return int(v) if v not in (None, "") else None
-        except (TypeError, ValueError):
-            return None
-
     conn = db()
     try:
         cur = conn.execute(
             "INSERT INTO web_targets (name, url, expected_status, keyword, slow_ms, "
             "cert_warn_days, enabled, created_at) VALUES (?, ?, ?, ?, ?, ?, 1, ?)",
-            (name, url, opt_int("expected_status"), (data.get("keyword") or "").strip() or None,
-             opt_int("slow_ms"), opt_int("cert_warn_days"), utcnow().isoformat())
+            (name, url, optional_int(data, "expected_status"),
+             (data.get("keyword") or "").strip() or None,
+             optional_int(data, "slow_ms"), optional_int(data, "cert_warn_days"),
+             utcnow().isoformat())
         )
         conn.commit()
         new_id = cur.lastrowid
@@ -3284,13 +3287,11 @@ def api_web_targets_update(target_id):
 @app.route("/api/web-targets/<int:target_id>", methods=["DELETE"])
 def api_web_targets_delete(target_id):
     row = get_web_target(target_id)
-    conn = db()
-    conn.execute("DELETE FROM web_targets WHERE id = ?", (target_id,))
-    conn.execute("DELETE FROM web_checks WHERE target_id = ?", (target_id,))
-    conn.execute("DELETE FROM alert_subscriptions WHERE instance_id = ? AND monitor_type = 'web'",
-                 (target_id,))
-    conn.commit()
-    conn.close()
+    with Db(commit=True) as conn:
+        conn.execute("DELETE FROM web_targets WHERE id = ?", (target_id,))
+        conn.execute("DELETE FROM web_checks WHERE target_id = ?", (target_id,))
+        conn.execute("DELETE FROM alert_subscriptions WHERE instance_id = ? AND monitor_type = 'web'",
+                     (target_id,))
     _prev_web_health.pop(target_id, None)
     log_audit("web.delete", target=row["name"] if row else f"id={target_id}")
     return jsonify({"ok": True})
@@ -3349,14 +3350,7 @@ def api_ip_targets_create():
     if method not in ("ping", "tcp"):
         return jsonify({"error": "method must be ping or tcp"}), 400
 
-    def opt_int(k):
-        v = data.get(k)
-        try:
-            return int(v) if v not in (None, "") else None
-        except (TypeError, ValueError):
-            return None
-
-    port = opt_int("port")
+    port = optional_int(data, "port")
     if method == "tcp" and not port:
         return jsonify({"error": "a port is required for a TCP check"}), 400
 
@@ -3365,7 +3359,8 @@ def api_ip_targets_create():
         cur = conn.execute(
             "INSERT INTO ip_targets (name, address, method, port, slow_ms, enabled, created_at) "
             "VALUES (?, ?, ?, ?, ?, 1, ?)",
-            (name, address, method, port, opt_int("slow_ms"), utcnow().isoformat())
+            (name, address, method, port, optional_int(data, "slow_ms"),
+             utcnow().isoformat())
         )
         conn.commit()
         new_id = cur.lastrowid
@@ -3422,13 +3417,11 @@ def api_ip_targets_update(target_id):
 @app.route("/api/ip-targets/<int:target_id>", methods=["DELETE"])
 def api_ip_targets_delete(target_id):
     row = get_ip_target(target_id)
-    conn = db()
-    conn.execute("DELETE FROM ip_targets WHERE id = ?", (target_id,))
-    conn.execute("DELETE FROM ip_checks WHERE target_id = ?", (target_id,))
-    conn.execute("DELETE FROM alert_subscriptions WHERE instance_id = ? AND monitor_type = 'ip'",
-                 (target_id,))
-    conn.commit()
-    conn.close()
+    with Db(commit=True) as conn:
+        conn.execute("DELETE FROM ip_targets WHERE id = ?", (target_id,))
+        conn.execute("DELETE FROM ip_checks WHERE target_id = ?", (target_id,))
+        conn.execute("DELETE FROM alert_subscriptions WHERE instance_id = ? AND monitor_type = 'ip'",
+                     (target_id,))
     _prev_ip_health.pop(target_id, None)
     log_audit("ip.delete", target=row["name"] if row else f"id={target_id}")
     return jsonify({"ok": True})
@@ -3554,10 +3547,8 @@ def api_users_delete(user_id):
     if target["role"] == ROLE_ADMIN and count_admins(user_id) == 0:
         return jsonify({"error": "cannot delete the last admin account"}), 400
 
-    conn = db()
-    conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
-    conn.commit()
-    conn.close()
+    with Db(commit=True) as conn:
+        conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
     log_audit("user.delete", target=target["username"])
     return jsonify({"ok": True})
 
@@ -3663,11 +3654,9 @@ def api_subscriptions_create():
 
 @app.route("/api/subscriptions/<int:sub_id>", methods=["DELETE"])
 def api_subscriptions_delete(sub_id):
-    conn = db()
-    row = conn.execute("SELECT * FROM alert_subscriptions WHERE id = ?", (sub_id,)).fetchone()
-    conn.execute("DELETE FROM alert_subscriptions WHERE id = ?", (sub_id,))
-    conn.commit()
-    conn.close()
+    with Db(commit=True) as conn:
+        row = conn.execute("SELECT * FROM alert_subscriptions WHERE id = ?", (sub_id,)).fetchone()
+        conn.execute("DELETE FROM alert_subscriptions WHERE id = ?", (sub_id,))
     if row:
         log_audit("subscription.delete", target=row["email"],
                   details=ALERT_TYPE_LABELS.get(row["alert_type"], row["alert_type"]))
