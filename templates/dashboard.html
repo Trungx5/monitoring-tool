@@ -275,7 +275,7 @@
   .panel-card h3 { font-size: 14px; margin: 0 0 14px; }
   .field { margin-bottom: 14px; }
   .field label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
-  .field input, .field select {
+  .field input, .field select, .field textarea {
     width: 100%;
     background: var(--bg);
     border: 1px solid var(--border);
@@ -284,7 +284,15 @@
     padding: 9px 10px;
     font-size: 13.5px;
   }
-  .field input:focus, .field select:focus { outline: none; border-color: var(--accent); }
+  .field input:focus, .field select:focus, .field textarea:focus {
+    outline: none; border-color: var(--accent);
+  }
+  /* Release notes are written as a list, so the box has to be as wide as
+     the lines going into it and resizable when they run long. */
+  .field textarea {
+    resize: vertical; min-height: 96px; line-height: 1.5;
+    font-family: inherit;
+  }
   .btn {
     background: var(--accent);
     border: none; color: #fff;
@@ -381,6 +389,36 @@
   .log-message { color: var(--text); flex: 1; word-break: break-word; }
 
   .whoami { font-size: 11.5px; color: var(--text); margin-bottom: 4px; }
+  /* Clicking the version opens the changelog, so it reads as a control
+     rather than a label. */
+  .version-badge {
+    background: none; border: 0; padding: 0; margin-bottom: 8px;
+    font: inherit; font-size: 11px; letter-spacing: 0.04em;
+    color: var(--muted); cursor: pointer; text-align: left;
+  }
+  .version-badge:hover { color: var(--accent); }
+  .version-badge strong { font-weight: 600; }
+
+  /* One release per row, newest first. The rule down the left binds a
+     release's heading to its notes without boxing every entry in a card. */
+  .release { border-left: 2px solid var(--border); padding: 0 0 20px 16px; position: relative; }
+  .release:last-child { padding-bottom: 4px; }
+  .release.current { border-left-color: var(--accent); }
+  .release-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+  .release-version { font-size: 17px; font-weight: 700; color: #fff; }
+  .release.current .release-version { color: var(--accent); }
+  .release-date { font-size: 11.5px; color: var(--muted); }
+  .release-notes {
+    margin-top: 6px; font-size: 13px; line-height: 1.6;
+    color: var(--text); white-space: pre-wrap; word-break: break-word;
+  }
+  .release-actions { margin-top: 8px; display: flex; gap: 6px; }
+  .current-pill {
+    font-size: 9.5px; font-weight: 700; letter-spacing: 0.08em;
+    padding: 2px 7px; border-radius: 999px;
+    background: rgba(91,141,239,0.16); color: var(--accent);
+    border: 1px solid rgba(91,141,239,0.4);
+  }
   .whoami .role { color: var(--muted); }
   .role-badge {
     font-size: 10px; font-weight: 700; letter-spacing: 0.04em;
@@ -483,6 +521,9 @@
     <button data-view="config" class="nav-btn admin-only">Configuration and Account</button>
   </div>
   <div class="sidebar-footer">
+    <button type="button" class="version-badge" id="versionBadge" title="Version">
+      <strong>&mdash;</strong>
+    </button>
     <div id="sidebarWhoami" class="whoami">Signed in</div>
     <form method="POST" action="/logout"><button type="submit" class="logout-btn">Log out</button></form>
   </div>
@@ -1005,7 +1046,46 @@
       <button class="subtab" data-sub="config-audit">Audit Log</button>
       <button class="subtab" data-sub="config-logs">Event Logs</button>
       <button class="subtab" data-sub="config-account">My Account</button>
+      <button class="subtab" data-sub="config-changelog">Changelog</button>
     </div>
+    <div class="subview" id="sub-config-changelog">
+      <h2 class="section-title">Changelog</h2>
+
+      <div class="panel-card admin-only" style="max-width:640px;">
+        <h3 style="margin:0 0 4px; font-size:14px;">Publish a release</h3>
+        <div class="stat-sub" style="margin:0 0 14px;">
+          The newest entry is the version shown throughout the app, so
+          publishing here is how the version changes.
+        </div>
+        <form id="releaseForm">
+          <div class="field">
+            <label for="releaseVersion">Version</label>
+            <input type="text" id="releaseVersion" placeholder="1.1.0" required>
+          </div>
+          <div class="field">
+            <label for="releaseDate">Released on</label>
+            <input type="date" id="releaseDate">
+          </div>
+          <div class="field">
+            <label for="releaseNotes">What changed</label>
+            <textarea id="releaseNotes" rows="6"
+              placeholder="One line per change, e.g.&#10;- Windows agents are now supported&#10;- Alerts wait two minutes before firing"
+              required></textarea>
+          </div>
+          <button type="submit" class="btn">Publish</button>
+          <button type="button" class="btn" id="releaseCancel" style="display:none;">Cancel</button>
+          <div class="form-msg" id="releaseMsg"></div>
+        </form>
+      </div>
+
+      <div class="panel-card" style="max-width:820px;">
+        <div id="changelogEmpty" class="empty-state" style="display:none;">
+          No releases recorded yet.
+        </div>
+        <div id="changelogList"></div>
+      </div>
+    </div>
+
     <div class="subview" id="sub-config-tags">
       <h2 class="section-title">Tag Manager</h2>
       <div class="panel-card" style="max-width:900px;">
@@ -1247,6 +1327,7 @@ const SUBTAB_LOADERS = {
   'config-audit': () => refreshAudit(),
   'config-logs': () => refreshLogs(),
   'config-account': () => renderAccount(),
+  'config-changelog': () => renderChangelog(),
 };
 
 function showView(name, subtab) {
@@ -1615,6 +1696,119 @@ function applyTagFilter(list, type) {
   if (!want) return list;
   return list.filter(t => (t.tags_list || []).some(x => x.toLowerCase() === want.toLowerCase()));
 }
+
+// ---------------------------------------------------------------------------
+// Changelog. The newest entry is the product version - there is no separate
+// version setting, so the two can never disagree.
+// ---------------------------------------------------------------------------
+let changelog = [];
+let editingReleaseId = null;
+
+async function refreshVersionBadge() {
+  const badge = document.getElementById('versionBadge');
+  if (!badge) return;
+  try {
+    const { version } = await (await apiFetch('/api/version')).json();
+    badge.querySelector('strong').textContent = version;
+  } catch (e) { /* leave the placeholder */ }
+}
+
+async function renderChangelog() {
+  const list = document.getElementById('changelogList');
+  try {
+    changelog = await (await apiFetch('/api/changelog')).json();
+  } catch (e) {
+    changelog = [];
+  }
+  document.getElementById('changelogEmpty').style.display = changelog.length ? 'none' : 'block';
+
+  list.innerHTML = changelog.map((e, i) => `
+    <div class="release ${i === 0 ? 'current' : ''}">
+      <div class="release-head">
+        <span class="release-version">${escapeHtml(e.version)}</span>
+        ${i === 0 ? '<span class="current-pill">CURRENT</span>' : ''}
+        <span class="release-date">${escapeHtml(e.released_on)}</span>
+      </div>
+      <div class="release-notes">${escapeHtml(e.notes)}</div>
+      ${(me && me.is_admin) ? `<div class="release-actions">
+        <button type="button" class="row-btn" data-rel-edit="${e.id}">Edit</button>
+        <button type="button" class="row-btn danger" data-rel-del="${e.id}">Delete</button>
+      </div>` : ''}
+    </div>`).join('');
+
+  list.querySelectorAll('[data-rel-edit]').forEach(b => b.addEventListener('click', () => {
+    startEditRelease(changelog.find(x => x.id === parseInt(b.dataset.relEdit, 10)));
+  }));
+  list.querySelectorAll('[data-rel-del]').forEach(b => b.addEventListener('click', () =>
+    deleteRelease(changelog.find(x => x.id === parseInt(b.dataset.relDel, 10)))));
+
+  refreshVersionBadge();
+}
+
+function startEditRelease(entry) {
+  if (!entry) return;
+  editingReleaseId = entry.id;
+  document.getElementById('releaseVersion').value = entry.version;
+  document.getElementById('releaseDate').value = entry.released_on;
+  document.getElementById('releaseNotes').value = entry.notes;
+  document.getElementById('releaseCancel').style.display = '';
+  document.querySelector('#releaseForm button[type=submit]').textContent = 'Save changes';
+  document.getElementById('releaseVersion').focus();
+}
+
+function resetReleaseForm() {
+  editingReleaseId = null;
+  document.getElementById('releaseForm').reset();
+  document.getElementById('releaseCancel').style.display = 'none';
+  document.querySelector('#releaseForm button[type=submit]').textContent = 'Publish';
+  document.getElementById('releaseMsg').textContent = '';
+}
+
+async function deleteRelease(entry) {
+  if (!entry) return;
+  if (!confirm(`Remove ${entry.version} from the changelog?\n\n`
+             + 'If it is the newest entry, the version shown in the app drops '
+             + 'back to the one before it.')) return;
+  const res = await apiFetch('/api/changelog/' + entry.id, { method: 'DELETE' });
+  if (!res.ok) { alert('Could not remove that release.'); return; }
+  if (editingReleaseId === entry.id) resetReleaseForm();
+  await renderChangelog();
+}
+
+document.getElementById('releaseForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const msg = document.getElementById('releaseMsg');
+  const body = JSON.stringify({
+    version: document.getElementById('releaseVersion').value,
+    released_on: document.getElementById('releaseDate').value,
+    notes: document.getElementById('releaseNotes').value,
+  });
+  const res = await apiFetch(
+    editingReleaseId ? '/api/changelog/' + editingReleaseId : '/api/changelog',
+    { method: editingReleaseId ? 'PATCH' : 'POST',
+      headers: { 'Content-Type': 'application/json' }, body });
+
+  if (!res.ok) {
+    let text = 'Could not save that release.';
+    try { text = (await res.json()).error || text; } catch (err) { /* keep default */ }
+    msg.style.color = 'var(--bad)';
+    msg.textContent = text;
+    return;
+  }
+  resetReleaseForm();
+  msg.style.color = 'var(--ok)';
+  msg.textContent = 'Saved.';
+  await renderChangelog();
+});
+
+document.getElementById('releaseCancel').addEventListener('click', resetReleaseForm);
+// Configuration is an admin section, so for a viewer the badge stays a label
+// rather than a door into a screen they were not meant to land on.
+document.getElementById('versionBadge').addEventListener('click', () => {
+  if (!(me && me.is_admin)) return;
+  showView('config', 'config-changelog');
+  document.getElementById('sidebar').classList.remove('open');
+});
 
 // ---------------------------------------------------------------------------
 // Tag Manager - the only place a tag can be renamed or removed everywhere at
@@ -2476,6 +2670,9 @@ async function loadMe() {
   document.querySelectorAll('.admin-only').forEach(el => {
     el.style.display = me.is_admin ? '' : 'none';
   });
+  const badge = document.getElementById('versionBadge');
+  badge.style.cursor = me.is_admin ? 'pointer' : 'default';
+  badge.title = me.is_admin ? 'View the changelog' : 'Version';
 }
 
 function renderAccount() {
@@ -3337,6 +3534,7 @@ document.getElementById('rangeSelect').addEventListener('change', (e) => {
 (async function init() {
   initRowMenus();
   await loadMe();
+  refreshVersionBadge();
   await loadInstances();
   await loadThresholds();
   showView('main');

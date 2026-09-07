@@ -72,6 +72,12 @@ DISK_FORECAST_MAX_DAYS = 365.0      # further out than this is not a prediction
 # percent a week is indistinguishable from log rotation and temp files.
 DISK_FORECAST_FLAT_PER_DAY = 0.02
 DISK_FORECAST_CACHE_SECONDS = 600
+
+# The version shown in the sidebar is whichever changelog entry is newest -
+# there is no separate version field to drift out of step with the notes.
+# This is only the value seeded into an empty changelog.
+INITIAL_VERSION = "v1.0.0"
+CHANGELOG_NOTES_MAX = 8000
 HEARTBEAT_INTERVAL_SECONDS = int(os.environ.get("HEARTBEAT_INTERVAL_SECONDS", "30"))
 # Websites are checked from the outside and are far less volatile than a
 # server's CPU, so they get a slower cadence - and hammering someone else's
@@ -843,6 +849,7 @@ SCHEMA_INDEXES = (
     ("idx_event_log_timestamp", "event_log", "timestamp"),
     ("idx_event_log_instance", "event_log", "instance_id"),
     ("idx_audit_log_timestamp", "audit_log", "timestamp"),
+    ("idx_changelog_released", "changelog", "released_on DESC, id DESC"),
 
     ("idx_web_checks_target", "web_checks", "target_id, id"),
     ("idx_web_checks_target_ts", "web_checks", "target_id, timestamp"),
@@ -879,6 +886,49 @@ def _add_missing_columns(conn):
 def _create_indexes(conn):
     for name, table, columns in SCHEMA_INDEXES:
         conn.execute(f"CREATE INDEX IF NOT EXISTS {name} ON {table}({columns})")
+    conn.commit()
+
+
+VERSION_PATTERN = re.compile(r"^v?(\d{1,4})\.(\d{1,4})\.(\d{1,4})([-+][0-9A-Za-z.\-]{1,32})?$")
+
+
+def normalize_version(raw):
+    """Accepts 1.2.3 or v1.2.3, with an optional -beta.1 style suffix, and
+    returns the canonical vX.Y.Z form. None when it is not a version."""
+    text = (raw or "").strip()
+    m = VERSION_PATTERN.match(text)
+    if not m:
+        return None
+    major, minor, patch, suffix = m.groups()
+    return f"v{int(major)}.{int(minor)}.{int(patch)}{suffix or ''}"
+
+
+def version_sort_key(version):
+    """Orders versions numerically, so v1.10.0 sits above v1.9.0 rather than
+    below it as a string comparison would have it. A pre-release suffix sorts
+    before the plain release of the same number, which is what -beta means."""
+    m = VERSION_PATTERN.match(version or "")
+    if not m:
+        return (0, 0, 0, 1, "")
+    major, minor, patch, suffix = m.groups()
+    return (int(major), int(minor), int(patch), 0 if suffix else 1, suffix or "")
+
+
+def _seed_changelog(conn):
+    """A product with no version reads as unfinished, so an empty changelog
+    gets its first entry rather than an empty screen."""
+    if conn.execute("SELECT id FROM changelog LIMIT 1").fetchone():
+        return
+    conn.execute(
+        "INSERT INTO changelog (version, released_on, notes, created_at, created_by) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (INITIAL_VERSION, utcnow().date().isoformat(),
+         "First tagged release.\n\n"
+         "Monitors Linux and Windows machines, websites and IP hosts from one "
+         "dashboard, with per-metric thresholds, email alerts on state change, "
+         "and disk-exhaustion forecasting.",
+         utcnow().isoformat(), None)
+    )
     conn.commit()
 
 
@@ -1044,6 +1094,17 @@ def _init_db_once():
     """)
 
     conn.execute("""
+        CREATE TABLE IF NOT EXISTS changelog (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            version TEXT NOT NULL,
+            released_on TEXT NOT NULL,
+            notes TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            created_by TEXT
+        )
+    """)
+
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS app_state (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
@@ -1132,6 +1193,7 @@ def _init_db_once():
     _add_missing_columns(conn)
     _create_indexes(conn)
     _copy_legacy_threshold_values(conn, thresholds_before)
+    _seed_changelog(conn)
 
     # --- one-time migration: the old single alert_email-per-instance model
     # becomes explicit (instance, email, alert_type) subscription rows, one
@@ -3117,6 +3179,119 @@ def api_tags_delete():
     log_audit("tag.delete", target=tag,
               details="removed from %d target(s)" % changed)
     return jsonify({"ok": True, "changed": changed})
+
+
+def get_changelog():
+    """Newest release first. Ordered by version rather than by insertion, so a
+    back-filled older entry lands in the right place."""
+    with Db() as conn:
+        rows = conn.execute("SELECT * FROM changelog").fetchall()
+    entries = [dict(r) for r in rows]
+    entries.sort(key=lambda e: version_sort_key(e["version"]), reverse=True)
+    return entries
+
+
+def current_version():
+    entries = get_changelog()
+    return entries[0]["version"] if entries else INITIAL_VERSION
+
+
+@app.route("/api/version")
+def api_version():
+    return jsonify({"version": current_version()})
+
+
+@app.route("/api/changelog")
+def api_changelog_list():
+    return jsonify(get_changelog())
+
+
+def _changelog_payload(data, existing=None):
+    """Shared validation. Returns (fields, error_response)."""
+    version = normalize_version(data.get("version")
+                                if "version" in data or existing is None
+                                else existing["version"])
+    if not version:
+        return None, (jsonify({"error": "version must look like 1.2.3 or v1.2.3"}), 400)
+
+    notes = (data.get("notes") if "notes" in data or existing is None
+             else existing["notes"]) or ""
+    notes = notes.strip()[:CHANGELOG_NOTES_MAX]
+    if not notes:
+        return None, (jsonify({"error": "describe what changed in this release"}), 400)
+
+    released_on = (data.get("released_on") or "").strip()
+    if not released_on:
+        released_on = existing["released_on"] if existing else utcnow().date().isoformat()
+    try:
+        datetime.strptime(released_on, "%Y-%m-%d")
+    except ValueError:
+        return None, (jsonify({"error": "released_on must be a date, as YYYY-MM-DD"}), 400)
+
+    return {"version": version, "notes": notes, "released_on": released_on}, None
+
+
+@app.route("/api/changelog", methods=["POST"])
+def api_changelog_create():
+    data = request.get_json(force=True, silent=True) or {}
+    fields, err = _changelog_payload(data)
+    if err:
+        return err
+
+    user = current_user()
+    with Db(commit=True) as conn:
+        clash = conn.execute("SELECT id FROM changelog WHERE version = ?",
+                             (fields["version"],)).fetchone()
+        if clash:
+            return jsonify({"error": f"{fields['version']} is already in the changelog"}), 409
+        cur = conn.execute(
+            "INSERT INTO changelog (version, released_on, notes, created_at, created_by) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (fields["version"], fields["released_on"], fields["notes"],
+             utcnow().isoformat(), user["username"] if user else None)
+        )
+        new_id = cur.lastrowid
+    log_audit("changelog.create", target=fields["version"],
+              details=fields["notes"].splitlines()[0][:120])
+    return jsonify(dict(fields, id=new_id)), 201
+
+
+@app.route("/api/changelog/<int:entry_id>", methods=["PATCH"])
+def api_changelog_update(entry_id):
+    data = request.get_json(force=True, silent=True) or {}
+    with Db() as conn:
+        row = conn.execute("SELECT * FROM changelog WHERE id = ?", (entry_id,)).fetchone()
+    if not row:
+        return jsonify({"error": "changelog entry not found"}), 404
+
+    fields, err = _changelog_payload(data, existing=row)
+    if err:
+        return err
+
+    with Db(commit=True) as conn:
+        clash = conn.execute("SELECT id FROM changelog WHERE version = ? AND id != ?",
+                             (fields["version"], entry_id)).fetchone()
+        if clash:
+            return jsonify({"error": f"{fields['version']} is already in the changelog"}), 409
+        conn.execute(
+            "UPDATE changelog SET version = ?, released_on = ?, notes = ? WHERE id = ?",
+            (fields["version"], fields["released_on"], fields["notes"], entry_id))
+    log_audit("changelog.update", target=fields["version"],
+              details=f"was {row['version']}" if row["version"] != fields["version"]
+              else "notes edited")
+    return jsonify(dict(fields, id=entry_id))
+
+
+@app.route("/api/changelog/<int:entry_id>", methods=["DELETE"])
+def api_changelog_delete(entry_id):
+    with Db(commit=True) as conn:
+        row = conn.execute("SELECT version FROM changelog WHERE id = ?",
+                           (entry_id,)).fetchone()
+        if not row:
+            return jsonify({"error": "changelog entry not found"}), 404
+        conn.execute("DELETE FROM changelog WHERE id = ?", (entry_id,))
+    log_audit("changelog.delete", target=row["version"])
+    return jsonify({"ok": True})
 
 
 @app.route("/api/metrics/latest-all")
