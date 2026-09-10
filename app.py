@@ -78,6 +78,12 @@ DISK_FORECAST_CACHE_SECONDS = 600
 # This is only the value seeded into an empty changelog.
 INITIAL_VERSION = "v1.0.0"
 CHANGELOG_NOTES_MAX = 8000
+
+# Announcement channels. Email reaches one person who has to be watching their
+# inbox; a group chat reaches whoever is on shift. Both run for every alert.
+CHANNEL_KINDS = ("telegram", "zalo", "webhook")
+CHANNEL_TIMEOUT_SECONDS = 6      # a slow channel must not stall the scrape loop
+CHANNEL_TEXT_LIMIT = {"telegram": 4000, "zalo": 2000, "webhook": 8000}
 HEARTBEAT_INTERVAL_SECONDS = int(os.environ.get("HEARTBEAT_INTERVAL_SECONDS", "30"))
 # Websites are checked from the outside and are far less volatile than a
 # server's CPU, so they get a slower cadence - and hammering someone else's
@@ -1094,6 +1100,23 @@ def _init_db_once():
     """)
 
     conn.execute("""
+        CREATE TABLE IF NOT EXISTS notification_channels (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            target TEXT,
+            secret TEXT,
+            monitor_types TEXT,
+            send_recoveries INTEGER NOT NULL DEFAULT 1,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            last_status TEXT,
+            last_error TEXT,
+            last_sent_at TEXT,
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS changelog (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             version TEXT NOT NULL,
@@ -2020,14 +2043,148 @@ def maybe_alert_health(inst, health, subscriptions):
         log_event("info" if val else "error", "health",
                   f"{HEALTH_CHECK_DEFS[key]}: {'OK' if val else 'FAILING'}", iid, inst["name"])
 
-        for email in emails_for_alert_type(subscriptions, key):
-            if val:
-                subject = f"[VPS Monitor] {inst['name']}: {label} - recovered"
-                body = f"{inst['name']} ({inst['target_url']}): {HEALTH_CHECK_DEFS[key]} is now OK."
-            else:
-                subject = f"[VPS Monitor] {inst['name']}: {label} - FAILING"
-                body = f"{inst['name']} ({inst['target_url']}): {HEALTH_CHECK_DEFS[key]} is FAILING."
-            send_alert_email(email, subject, body)
+        if val:
+            subject = f"[VPS Monitor] {inst['name']}: {label} - recovered"
+            body = f"{inst['name']} ({inst['target_url']}): {HEALTH_CHECK_DEFS[key]} is now OK."
+        else:
+            subject = f"[VPS Monitor] {inst['name']}: {label} - FAILING"
+            body = f"{inst['name']} ({inst['target_url']}): {HEALTH_CHECK_DEFS[key]} is FAILING."
+        announce(subject, body, emails_for_alert_type(subscriptions, key),
+                 monitor_type="vps", resolved=bool(val))
+
+
+# One session for the life of the process: an alert storm otherwise pays for a
+# fresh TLS handshake to Telegram on every single message.
+_notify_session = requests.Session()
+
+
+def _channel_text(kind, subject, body):
+    return f"{subject}\n\n{body}"[:CHANNEL_TEXT_LIMIT.get(kind, 4000)]
+
+
+def _send_telegram(channel, subject, body):
+    """Bot API. The token comes from @BotFather and the chat id from the chat
+    the bot was added to - for a group, that id is negative."""
+    token = decrypt_secret(channel["secret"])
+    if not token or not channel["target"]:
+        raise ValueError("a bot token and a chat id are both required")
+    resp = _notify_session.post(
+        f"https://api.telegram.org/bot{token}/sendMessage",
+        json={"chat_id": channel["target"],
+              "text": _channel_text("telegram", subject, body),
+              "disable_web_page_preview": True},
+        timeout=CHANNEL_TIMEOUT_SECONDS)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Telegram refused it: {resp.text[:200]}")
+
+
+def _send_zalo(channel, subject, body):
+    """Zalo Official Account, customer-service message.
+
+    Zalo answers 200 with an error object in the body rather than an HTTP
+    error code, so the status alone says nothing - the body has to be read.
+    """
+    token = decrypt_secret(channel["secret"])
+    if not token or not channel["target"]:
+        raise ValueError("an OA access token and a user id are both required")
+    resp = _notify_session.post(
+        "https://openapi.zalo.me/v3.0/oa/message/cs",
+        headers={"access_token": token, "Content-Type": "application/json"},
+        json={"recipient": {"user_id": channel["target"]},
+              "message": {"text": _channel_text("zalo", subject, body)}},
+        timeout=CHANNEL_TIMEOUT_SECONDS)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Zalo refused it: {resp.text[:200]}")
+    try:
+        payload = resp.json()
+    except ValueError:
+        raise RuntimeError(f"Zalo sent back something unreadable: {resp.text[:200]}")
+    if payload.get("error"):
+        raise RuntimeError(f"Zalo error {payload['error']}: "
+                           f"{payload.get('message') or 'no reason given'}")
+
+
+def _send_webhook(channel, subject, body):
+    """Anything that accepts a JSON POST. The same payload carries `text` and
+    `content` as well as the parts, so Slack, Discord and a plain endpoint all
+    understand it without a per-service adapter."""
+    url = decrypt_secret(channel["secret"])
+    if not url:
+        raise ValueError("a webhook URL is required")
+    text = _channel_text("webhook", subject, body)
+    resp = _notify_session.post(
+        url, json={"subject": subject, "body": body, "text": text, "content": text},
+        timeout=CHANNEL_TIMEOUT_SECONDS)
+    if resp.status_code >= 300:
+        raise RuntimeError(f"webhook answered {resp.status_code}: {resp.text[:200]}")
+
+
+CHANNEL_SENDERS = {"telegram": _send_telegram, "zalo": _send_zalo,
+                   "webhook": _send_webhook}
+
+
+def get_channels(include_secrets=False):
+    with Db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM notification_channels ORDER BY id").fetchall()
+    channels = []
+    for row in rows:
+        ch = dict(row)
+        ch["enabled"] = bool(ch["enabled"])
+        ch["send_recoveries"] = bool(ch["send_recoveries"])
+        ch["monitor_types_list"] = [t for t in (ch["monitor_types"] or "").split(",") if t]
+        ch["has_secret"] = bool(ch["secret"])
+        if not include_secrets:
+            ch.pop("secret", None)
+        channels.append(ch)
+    return channels
+
+
+def _record_channel_result(channel_id, error):
+    with Db(commit=True) as conn:
+        conn.execute(
+            "UPDATE notification_channels SET last_status = ?, last_error = ?, "
+            "last_sent_at = ? WHERE id = ?",
+            ("error" if error else "ok", error, utcnow().isoformat(), channel_id))
+
+
+def send_to_channel(channel, subject, body):
+    """Returns None on success or the failure text. Never raises: a broken
+    channel must not stop the other channels, the emails, or the scrape."""
+    sender = CHANNEL_SENDERS.get(channel["kind"])
+    if not sender:
+        return f"unknown channel type: {channel['kind']}"
+    try:
+        sender(channel, subject, body)
+        return None
+    except Exception as e:
+        return str(e)[:400]
+
+
+def deliver_to_channels(subject, body, monitor_type=None, resolved=False):
+    """Broadcasts one alert to every channel that wants it. Runs whether or not
+    anyone is subscribed by email - a channel is the announcement, not a
+    per-person subscription."""
+    for channel in get_channels(include_secrets=True):
+        if not channel["enabled"]:
+            continue
+        if resolved and not channel["send_recoveries"]:
+            continue
+        wanted = channel["monitor_types_list"]
+        if wanted and monitor_type and monitor_type not in wanted:
+            continue
+        error = send_to_channel(channel, subject, body)
+        _record_channel_result(channel["id"], error)
+        if error:
+            logger.error(f"Channel '{channel['name']}' ({channel['kind']}) failed: {error}")
+
+
+def announce(subject, body, emails=(), monitor_type=None, resolved=False):
+    """Every route one alert goes out by. Subject and body are built once by
+    the caller rather than per recipient, since they are identical for all."""
+    for addr in emails:
+        send_alert_email(addr, subject, body)
+    deliver_to_channels(subject, body, monitor_type, resolved)
 
 
 def send_alert_email(to_addr, subject, body):
@@ -2080,16 +2237,16 @@ def maybe_alert(inst, metrics, thresholds, subscriptions):
         log_level = {"good": "info", "warn": "warn", "critical": "error"}[sev]
         log_event(log_level, "severity", f"{label}: {sev.upper()} ({value}{unit})", iid, inst["name"])
 
-        for email in emails_for_alert_type(subscriptions, key):
-            if sev == "good":
-                subject = f"[VPS Monitor] {inst['name']}: {alert_label} - recovered"
-                body = f"{inst['name']} ({inst['target_url']}): {label} is back to normal ({value}{unit})."
-            else:
-                subject = f"[VPS Monitor] {inst['name']}: {alert_label} - {sev.upper()}"
-                body = (f"{inst['name']} ({inst['target_url']}): {label} is {sev.upper()} "
-                        f"at {value}{unit} (warn={thresholds.get(key + '_warn')}, "
-                        f"crit={thresholds.get(key + '_crit')}).")
-            send_alert_email(email, subject, body)
+        if sev == "good":
+            subject = f"[VPS Monitor] {inst['name']}: {alert_label} - recovered"
+            body = f"{inst['name']} ({inst['target_url']}): {label} is back to normal ({value}{unit})."
+        else:
+            subject = f"[VPS Monitor] {inst['name']}: {alert_label} - {sev.upper()}"
+            body = (f"{inst['name']} ({inst['target_url']}): {label} is {sev.upper()} "
+                    f"at {value}{unit} (warn={thresholds.get(key + '_warn')}, "
+                    f"crit={thresholds.get(key + '_crit')}).")
+        announce(subject, body, emails_for_alert_type(subscriptions, key),
+                 monitor_type="vps", resolved=(sev == "good"))
 
 
 # ---------------------------------------------------------------------------
@@ -2327,14 +2484,14 @@ def maybe_alert_web(target, health, subscriptions, latest):
         elif key in ("status", "reachable") and latest:
             detail = f" ({latest.get('error') or 'HTTP ' + str(latest.get('status_code'))})"
 
-        for email in emails_for_alert_type(subscriptions, alert_type):
-            if val:
-                subject = f"[VPS Monitor] {target['name']}: {label} - recovered"
-                body = f"{target['name']} ({target['url']}): {WEB_CHECK_DEFS[key]} is OK again{detail}."
-            else:
-                subject = f"[VPS Monitor] {target['name']}: {label}"
-                body = f"{target['name']} ({target['url']}): {WEB_CHECK_DEFS[key]} is FAILING{detail}."
-            send_alert_email(email, subject, body)
+        if val:
+            subject = f"[VPS Monitor] {target['name']}: {label} - recovered"
+            body = f"{target['name']} ({target['url']}): {WEB_CHECK_DEFS[key]} is OK again{detail}."
+        else:
+            subject = f"[VPS Monitor] {target['name']}: {label}"
+            body = f"{target['name']} ({target['url']}): {WEB_CHECK_DEFS[key]} is FAILING{detail}."
+        announce(subject, body, emails_for_alert_type(subscriptions, alert_type),
+                 monitor_type="web", resolved=bool(val))
 
 
 # The uptime view asks for 3 windows x every target in one page load, and the
@@ -2639,12 +2796,12 @@ def maybe_alert_ip(target, health, subscriptions, latest):
         elif latest and latest.get("error"):
             detail = f" ({latest['error']})"
 
-        for email in emails_for_alert_type(subscriptions, alert_type):
-            state = "recovered" if val else "FAILING"
-            subject = f"[VPS Monitor] {target['name']}: {label} - {state}"
-            body = (f"{target['name']} ({target['address']}): "
-                    f"{IP_CHECK_DEFS[key]} is {'OK again' if val else 'FAILING'}{detail}.")
-            send_alert_email(email, subject, body)
+        state = "recovered" if val else "FAILING"
+        subject = f"[VPS Monitor] {target['name']}: {label} - {state}"
+        body = (f"{target['name']} ({target['address']}): "
+                f"{IP_CHECK_DEFS[key]} is {'OK again' if val else 'FAILING'}{detail}.")
+        announce(subject, body, emails_for_alert_type(subscriptions, alert_type),
+                 monitor_type="ip", resolved=bool(val))
 
 
 def trim_ip_checks():
@@ -3199,6 +3356,141 @@ def current_version():
 @app.route("/api/version")
 def api_version():
     return jsonify({"version": current_version()})
+
+
+@app.route("/api/channels")
+def api_channels_list():
+    return jsonify(get_channels())
+
+
+def _channel_payload(data, existing=None):
+    """Shared validation. Returns (fields, error_response). A blank secret on
+    an edit means "leave the stored one alone" - the API never sends secrets
+    back out, so the form has nothing to resubmit."""
+    name = (data.get("name") or (existing["name"] if existing else "")).strip()
+    if not name:
+        return None, (jsonify({"error": "give the channel a name"}), 400)
+
+    kind = (data.get("kind") or (existing["kind"] if existing else "")).strip().lower()
+    if kind not in CHANNEL_KINDS:
+        return None, (jsonify(
+            {"error": "kind must be one of: " + ", ".join(CHANNEL_KINDS)}), 400)
+
+    target = (data.get("target") or "").strip()
+    if not target and existing:
+        target = existing["target"] or ""
+
+    secret = (data.get("secret") or "").strip()
+    if not secret and existing:
+        secret = existing["secret"] or ""
+
+    if kind == "webhook":
+        if not secret.lower().startswith(("http://", "https://")):
+            return None, (jsonify(
+                {"error": "the webhook URL must start with http:// or https://"}), 400)
+        target = ""
+    else:
+        if not secret:
+            label = "bot token" if kind == "telegram" else "OA access token"
+            return None, (jsonify({"error": f"a {label} is required"}), 400)
+        if not target:
+            label = "chat id" if kind == "telegram" else "user id"
+            return None, (jsonify({"error": f"a {label} is required"}), 400)
+
+    wanted = data.get("monitor_types")
+    if wanted is None and existing:
+        types = existing["monitor_types"]
+    else:
+        if isinstance(wanted, str):
+            wanted = [t for t in wanted.split(",")]
+        picked = [t.strip().lower() for t in (wanted or []) if t.strip().lower() in MONITOR_TABLES]
+        types = ",".join(sorted(set(picked))) or None
+
+    def flag(key, default):
+        if key in data:
+            return 1 if data.get(key) else 0
+        return existing[key] if existing else default
+
+    return {"name": name[:80], "kind": kind, "target": target[:200] or None,
+            "secret": encrypt_secret(secret) or None, "monitor_types": types,
+            "send_recoveries": flag("send_recoveries", 1),
+            "enabled": flag("enabled", 1)}, None
+
+
+@app.route("/api/channels", methods=["POST"])
+def api_channels_create():
+    data = request.get_json(force=True, silent=True) or {}
+    fields, err = _channel_payload(data)
+    if err:
+        return err
+    with Db(commit=True) as conn:
+        cur = conn.execute(
+            "INSERT INTO notification_channels (name, kind, target, secret, "
+            "monitor_types, send_recoveries, enabled, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (fields["name"], fields["kind"], fields["target"], fields["secret"],
+             fields["monitor_types"], fields["send_recoveries"], fields["enabled"],
+             utcnow().isoformat()))
+        new_id = cur.lastrowid
+    log_audit("channel.create", target=fields["name"], details=fields["kind"])
+    return jsonify({"id": new_id, "name": fields["name"], "kind": fields["kind"]}), 201
+
+
+@app.route("/api/channels/<int:channel_id>", methods=["PATCH"])
+def api_channels_update(channel_id):
+    data = request.get_json(force=True, silent=True) or {}
+    with Db() as conn:
+        row = conn.execute("SELECT * FROM notification_channels WHERE id = ?",
+                           (channel_id,)).fetchone()
+    if not row:
+        return jsonify({"error": "channel not found"}), 404
+
+    fields, err = _channel_payload(data, existing=row)
+    if err:
+        return err
+    with Db(commit=True) as conn:
+        conn.execute(
+            "UPDATE notification_channels SET name = ?, kind = ?, target = ?, "
+            "secret = ?, monitor_types = ?, send_recoveries = ?, enabled = ? "
+            "WHERE id = ?",
+            (fields["name"], fields["kind"], fields["target"], fields["secret"],
+             fields["monitor_types"], fields["send_recoveries"], fields["enabled"],
+             channel_id))
+    log_audit("channel.update", target=fields["name"],
+              details="disabled" if not fields["enabled"] else fields["kind"])
+    return jsonify({"ok": True})
+
+
+@app.route("/api/channels/<int:channel_id>", methods=["DELETE"])
+def api_channels_delete(channel_id):
+    with Db(commit=True) as conn:
+        row = conn.execute("SELECT name FROM notification_channels WHERE id = ?",
+                           (channel_id,)).fetchone()
+        if not row:
+            return jsonify({"error": "channel not found"}), 404
+        conn.execute("DELETE FROM notification_channels WHERE id = ?", (channel_id,))
+    log_audit("channel.delete", target=row["name"])
+    return jsonify({"ok": True})
+
+
+@app.route("/api/channels/<int:channel_id>/test", methods=["POST"])
+def api_channels_test(channel_id):
+    """Sends one real message. A token pasted into a form is either right or
+    silently wrong, and finding out during an outage is too late."""
+    channel = next((c for c in get_channels(include_secrets=True)
+                    if c["id"] == channel_id), None)
+    if not channel:
+        return jsonify({"error": "channel not found"}), 404
+
+    error = send_to_channel(
+        channel, "[VPS Monitor] Test message",
+        "If you can read this, alerts will reach this channel.")
+    _record_channel_result(channel_id, error)
+    log_audit("channel.test", target=channel["name"],
+              details=error or "delivered")
+    if error:
+        return jsonify({"ok": False, "error": error}), 502
+    return jsonify({"ok": True})
 
 
 @app.route("/api/changelog")

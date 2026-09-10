@@ -413,6 +413,22 @@
     color: var(--text); white-space: pre-wrap; word-break: break-word;
   }
   .release-actions { margin-top: 8px; display: flex; gap: 6px; }
+  .kind-pill {
+    font-size: 9.5px; font-weight: 700; letter-spacing: 0.08em;
+    padding: 2px 7px; border-radius: 3px; text-transform: uppercase;
+    background: rgba(139,145,163,0.16); color: var(--muted);
+    border: 1px solid var(--border);
+  }
+  .kind-pill.telegram { background: rgba(56,150,220,0.16); color: #4fa8e0; border-color: rgba(56,150,220,0.4); }
+  .kind-pill.zalo     { background: rgba(0,104,255,0.16);  color: #4d8dff; border-color: rgba(0,104,255,0.4); }
+  .kind-pill.webhook  { background: rgba(139,145,163,0.16); color: var(--muted); }
+  .channel-note { font-size: 11.5px; color: var(--muted); margin-top: 4px; }
+  .channel-note.bad { color: var(--bad); }
+  .channel-note.ok { color: var(--ok); }
+  .channel-off { opacity: 0.55; }
+  .checkline { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; font-size: 13px; }
+  .checkline input { width: auto; }
+  .typechecks { display: flex; gap: 14px; flex-wrap: wrap; }
   .current-pill {
     font-size: 9.5px; font-weight: 700; letter-spacing: 0.08em;
     padding: 2px 7px; border-radius: 999px;
@@ -981,6 +997,7 @@
     <div class="subtabs">
       <button class="subtab active" data-sub="notify-add">Add Alert</button>
       <button class="subtab" data-sub="notify-list">Alert List</button>
+      <button class="subtab" data-sub="notify-channels">Zalo / Telegram</button>
     </div>
 
     <div class="subview active" id="sub-notify-add">
@@ -1020,6 +1037,70 @@
           alerts, and different people can be wired to different ones. Email is sent on a
           change of state, not on every check.
         </div>
+      </div>
+    </div>
+
+    <div class="subview" id="sub-notify-channels">
+      <h2 class="section-title">Zalo / Telegram</h2>
+      <div class="stat-sub" style="max-width:760px; margin-top:0;">
+        Email reaches one person who has to be watching their inbox. A channel
+        posts into a group chat, so every alert reaches whoever is on shift -
+        including the ones nobody subscribed to by email.
+      </div>
+
+      <div class="panel-card" style="max-width:620px;">
+        <form id="channelForm">
+          <div class="field">
+            <label for="chKind">Send through</label>
+            <select id="chKind">
+              <option value="telegram">Telegram</option>
+              <option value="zalo">Zalo Official Account</option>
+              <option value="webhook">Webhook (Slack, Discord, anything else)</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="chName">Name</label>
+            <input type="text" id="chName" placeholder="Ops group" required>
+          </div>
+          <div class="field" id="chTargetField">
+            <label for="chTarget"><span id="chTargetLabel">Chat ID</span></label>
+            <input type="text" id="chTarget" placeholder="-1001234567890">
+            <div class="channel-note" id="chTargetHelp"></div>
+          </div>
+          <div class="field">
+            <label for="chSecret"><span id="chSecretLabel">Bot token</span></label>
+            <input type="password" id="chSecret" placeholder="123456:ABC-DEF...">
+            <div class="channel-note" id="chSecretHelp"></div>
+          </div>
+          <div class="field">
+            <label>Send alerts about</label>
+            <div class="typechecks">
+              <label class="checkline"><input type="checkbox" class="ch-type" value="vps" checked> VPS</label>
+              <label class="checkline"><input type="checkbox" class="ch-type" value="web" checked> Websites</label>
+              <label class="checkline"><input type="checkbox" class="ch-type" value="ip" checked> IP hosts</label>
+            </div>
+          </div>
+          <label class="checkline">
+            <input type="checkbox" id="chRecoveries" checked>
+            Also post when something recovers
+          </label>
+          <label class="checkline">
+            <input type="checkbox" id="chEnabled" checked> Enabled
+          </label>
+          <button type="submit" class="btn">Add channel</button>
+          <button type="button" class="btn" id="chCancel" style="display:none;">Cancel</button>
+          <div class="form-msg" id="chMsg"></div>
+        </form>
+      </div>
+
+      <div class="panel-card" style="max-width:820px;">
+        <div id="channelsEmpty" class="empty-state" style="display:none;">
+          No channels yet. Alerts are going out by email only.
+        </div>
+        <table class="subs-table" id="channelsTable" style="display:none;">
+          <thead><tr><th>Name</th><th>Type</th><th>Sends</th><th>Last result</th><th></th></tr></thead>
+          <tbody id="channelsBody"></tbody>
+        </table>
       </div>
     </div>
 
@@ -1321,6 +1402,7 @@ const SUBTAB_LOADERS = {
   'vps-health': () => renderHealthChecks(),
   'notify-add': () => renderAlertsForm(),
   'notify-list': () => refreshSubscriptions(),
+  'notify-channels': () => renderChannels(),
   'config-thresholds': () => renderAlertsForm(),
   'config-tags': () => renderTagManager(),
   'config-users': () => refreshUsers(),
@@ -1696,6 +1778,186 @@ function applyTagFilter(list, type) {
   if (!want) return list;
   return list.filter(t => (t.tags_list || []).some(x => x.toLowerCase() === want.toLowerCase()));
 }
+
+// ---------------------------------------------------------------------------
+// Announcement channels. Unlike an email subscription, a channel is not tied
+// to one target - it receives every alert of the monitor types it is set to.
+// ---------------------------------------------------------------------------
+let channels = [];
+let editingChannelId = null;
+
+// What the two free-text fields mean changes per service, so the labels and
+// the hints move with the dropdown instead of being one vague pair.
+const CHANNEL_FIELDS = {
+  telegram: {
+    target: 'Chat ID',
+    targetHelp: 'Add the bot to your group, then read the chat id from '
+              + 'api.telegram.org/bot&lt;token&gt;/getUpdates. Group ids start with a minus sign.',
+    secret: 'Bot token',
+    secretHelp: 'Create a bot by messaging @BotFather on Telegram. Free, takes a minute.',
+    targetShown: true,
+  },
+  zalo: {
+    target: 'Zalo user ID',
+    targetHelp: 'The user must have messaged your Official Account within the last 48 hours '
+              + 'for a customer-service message to be accepted.',
+    secret: 'OA access token',
+    secretHelp: 'Requires a verified Zalo Official Account. The token expires and has to be '
+              + 'refreshed - if that is a problem, use a webhook into a relay instead.',
+    targetShown: true,
+  },
+  webhook: {
+    target: '',
+    targetHelp: '',
+    secret: 'Webhook URL',
+    secretHelp: 'The alert is POSTed as JSON carrying subject, body, text and content, '
+              + 'so Slack and Discord webhooks work without any extra setup.',
+    targetShown: false,
+  },
+};
+
+function applyChannelKind() {
+  const kind = document.getElementById('chKind').value;
+  const spec = CHANNEL_FIELDS[kind];
+  document.getElementById('chTargetField').style.display = spec.targetShown ? '' : 'none';
+  document.getElementById('chTargetLabel').textContent = spec.target;
+  document.getElementById('chTargetHelp').innerHTML = spec.targetHelp;
+  document.getElementById('chSecretLabel').textContent = spec.secret;
+  document.getElementById('chSecretHelp').innerHTML = spec.secretHelp;
+}
+
+async function renderChannels() {
+  try {
+    channels = await (await apiFetch('/api/channels')).json();
+  } catch (e) {
+    channels = [];
+  }
+  document.getElementById('channelsEmpty').style.display = channels.length ? 'none' : 'block';
+  document.getElementById('channelsTable').style.display = channels.length ? 'table' : 'none';
+
+  document.getElementById('channelsBody').innerHTML = channels.map(ch => {
+    const types = ch.monitor_types_list.length
+      ? ch.monitor_types_list.map(t => t.toUpperCase()).join(', ') : 'Everything';
+    let last = '<span style="color:var(--muted);">not used yet</span>';
+    if (ch.last_status === 'ok') {
+      last = `<span style="color:var(--ok);">delivered</span>`;
+    } else if (ch.last_status === 'error') {
+      last = `<span style="color:var(--bad);">${escapeHtml((ch.last_error || 'failed').slice(0, 70))}</span>`;
+    }
+    return `<tr class="${ch.enabled ? '' : 'channel-off'}">
+      <td style="font-weight:600; color:#fff;">${escapeHtml(ch.name)}
+        ${ch.enabled ? '' : '<span class="kind-pill">OFF</span>'}</td>
+      <td><span class="kind-pill ${ch.kind}">${ch.kind}</span></td>
+      <td>${types}${ch.send_recoveries ? '' : '<div class="channel-note">problems only</div>'}</td>
+      <td>${last}</td>
+      <td style="text-align:right; white-space:nowrap;">
+        <button type="button" class="row-btn" data-ch-test="${ch.id}">Send test</button>
+        <button type="button" class="row-btn" data-ch-edit="${ch.id}">Edit</button>
+        <button type="button" class="row-btn danger" data-ch-del="${ch.id}">Delete</button>
+      </td>
+    </tr>`;
+  }).join('');
+
+  const find = id => channels.find(c => c.id === parseInt(id, 10));
+  document.querySelectorAll('[data-ch-test]').forEach(b =>
+    b.addEventListener('click', () => testChannel(find(b.dataset.chTest), b)));
+  document.querySelectorAll('[data-ch-edit]').forEach(b =>
+    b.addEventListener('click', () => startEditChannel(find(b.dataset.chEdit))));
+  document.querySelectorAll('[data-ch-del]').forEach(b =>
+    b.addEventListener('click', () => deleteChannel(find(b.dataset.chDel))));
+}
+
+async function testChannel(ch, btn) {
+  if (!ch) return;
+  const original = btn.textContent;
+  btn.textContent = 'Sending...';
+  btn.disabled = true;
+  const res = await apiFetch(`/api/channels/${ch.id}/test`, { method: 'POST' });
+  btn.disabled = false;
+  btn.textContent = original;
+  if (!res.ok) {
+    let why = 'it did not go through.';
+    try { why = (await res.json()).error || why; } catch (e) { /* keep default */ }
+    alert(`Test message failed.\n\n${why}`);
+  }
+  await renderChannels();
+}
+
+function startEditChannel(ch) {
+  if (!ch) return;
+  editingChannelId = ch.id;
+  document.getElementById('chKind').value = ch.kind;
+  applyChannelKind();
+  document.getElementById('chName').value = ch.name;
+  document.getElementById('chTarget').value = ch.target || '';
+  document.getElementById('chSecret').value = '';
+  document.getElementById('chSecret').placeholder = ch.has_secret
+    ? 'unchanged - type a new one to replace it' : '';
+  document.querySelectorAll('.ch-type').forEach(cb => {
+    cb.checked = !ch.monitor_types_list.length || ch.monitor_types_list.includes(cb.value);
+  });
+  document.getElementById('chRecoveries').checked = ch.send_recoveries;
+  document.getElementById('chEnabled').checked = ch.enabled;
+  document.getElementById('chCancel').style.display = '';
+  document.querySelector('#channelForm button[type=submit]').textContent = 'Save changes';
+  document.getElementById('chName').focus();
+}
+
+function resetChannelForm() {
+  editingChannelId = null;
+  document.getElementById('channelForm').reset();
+  document.getElementById('chSecret').placeholder = '';
+  document.getElementById('chCancel').style.display = 'none';
+  document.querySelector('#channelForm button[type=submit]').textContent = 'Add channel';
+  document.getElementById('chMsg').textContent = '';
+  applyChannelKind();
+}
+
+async function deleteChannel(ch) {
+  if (!ch) return;
+  if (!confirm(`Delete the channel "${ch.name}"? Alerts stop going there.`)) return;
+  const res = await apiFetch('/api/channels/' + ch.id, { method: 'DELETE' });
+  if (!res.ok) { alert('Could not delete that channel.'); return; }
+  if (editingChannelId === ch.id) resetChannelForm();
+  await renderChannels();
+}
+
+document.getElementById('chKind').addEventListener('change', applyChannelKind);
+document.getElementById('chCancel').addEventListener('click', resetChannelForm);
+
+document.getElementById('channelForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const msg = document.getElementById('chMsg');
+  const types = [...document.querySelectorAll('.ch-type:checked')].map(cb => cb.value);
+  const body = JSON.stringify({
+    name: document.getElementById('chName').value,
+    kind: document.getElementById('chKind').value,
+    target: document.getElementById('chTarget').value,
+    secret: document.getElementById('chSecret').value,
+    // All three ticked means "everything", which is stored as no filter at all.
+    monitor_types: types.length === 3 ? [] : types,
+    send_recoveries: document.getElementById('chRecoveries').checked,
+    enabled: document.getElementById('chEnabled').checked,
+  });
+  const res = await apiFetch(
+    editingChannelId ? '/api/channels/' + editingChannelId : '/api/channels',
+    { method: editingChannelId ? 'PATCH' : 'POST',
+      headers: { 'Content-Type': 'application/json' }, body });
+
+  if (!res.ok) {
+    let text = 'Could not save that channel.';
+    try { text = (await res.json()).error || text; } catch (err) { /* keep default */ }
+    msg.style.color = 'var(--bad)';
+    msg.textContent = text;
+    return;
+  }
+  resetChannelForm();
+  msg.style.color = 'var(--ok)';
+  msg.textContent = 'Saved. Use Send test to check it works.';
+  await renderChannels();
+});
+
+applyChannelKind();
 
 // ---------------------------------------------------------------------------
 // Changelog. The newest entry is the product version - there is no separate
